@@ -1,6 +1,12 @@
+/* TODO
+ * - sprawdzanie cmd_seq
+ * */
+
 #include <iostream>
 #include <regex>
 #include <algorithm>
+#include <chrono>
+#include <vector>
 
 #include <boost/program_options.hpp>
 #include <boost/tokenizer.hpp>
@@ -13,6 +19,7 @@
 #include "connection.h"
 
 namespace po = boost::program_options;
+namespace chr = std::chrono;
 
 std::size_t TIMEOUT_DEFAULT = 5;
 std::size_t TIMEOUT_MAX = 300;
@@ -29,6 +36,12 @@ struct client_options {
 struct client_state {
     int socket{};
     struct sockaddr_in remote_address{};
+};
+
+struct server_info {
+    std::string address;
+    std::string multicast_address;
+    uint64_t free_space;
 };
 
 client_state current_client_state{};
@@ -89,9 +102,6 @@ void initialize_connection(const client_options &options, client_state &state) {
         throw std::runtime_error("bind");
     }
 
-    std::cout << "port: " << htons(local_address.sin_port) << "\n";
-    std::cout << "addr: " << inet_ntoa(local_address.sin_addr) << "\n";
-
     /* enabling broadcast */
     set_socket_option(state.socket, ENABLE_BROADCAST, SOL_SOCKET, SO_BROADCAST, "setsockopt broadcast");
 
@@ -104,65 +114,120 @@ void initialize_connection(const client_options &options, client_state &state) {
     if (inet_aton(options.MCAST_ADDR.c_str(), &state.remote_address.sin_addr) == 0) {
         throw std::runtime_error("inet aton");
     }
-
 }
 
-void discover(client_state &state) {
+uint64_t send_simple_message(client_state &state, std::string cmd, std::string data) {
     /* TODO z czy bez nawiasów */
-    SIMPL_CMD hello("HELLO", get_cmd_seq(), "");
+    uint64_t cmd_seq = get_cmd_seq();
+    SIMPL_CMD hello(cmd, cmd_seq, data);
     if (sendto(state.socket, hello.serialized, hello.serialized_length, 0,
                (struct sockaddr *) &state.remote_address,
                sizeof state.remote_address) != hello.serialized_length) {
         throw std::runtime_error("write");
     }
+}
 
-    /* TODO sprawdzić czy wiadomość jest poprawna, bo będą błędy przy deserializacji */
+void discover_single_address(client_state &state, const chr::system_clock::time_point &end_point,
+        const chr::system_clock::time_point &current_time, struct timeval &wait_time, char *buffer,
+        std::vector<server_info> &server_messages) {
+    struct sockaddr_in server_address{};
+    socklen_t addrlen = sizeof server_address;
     ssize_t rcv_len;
-    char buffer[BSIZE];
-    memset(buffer, 0, BSIZE);
-    rcv_len = read(state.socket, buffer, sizeof buffer);
-    if (rcv_len < 0) {
-        throw std::runtime_error("read");
+    chr::nanoseconds remaining_time = end_point - current_time;
+    chr::seconds sec = chr::duration_cast<chr::seconds>(remaining_time);
+    wait_time.tv_sec = sec.count();
+    wait_time.tv_usec = chr::duration_cast<chr::microseconds>(remaining_time - sec).count();
+    if (setsockopt(state.socket, SOL_SOCKET, SO_RCVTIMEO, (void *)&wait_time,
+                   sizeof wait_time) < 0) {
+        throw std::runtime_error("setsockopt");
     }
-    else {
-        printf("read %zd bytes: %.*s\n", rcv_len, (int) rcv_len, buffer);
-        CMPLX_CMD good_day(buffer, rcv_len);
 
-        std::cout << good_day.cmd << " " << good_day.cmd_seq << " " << good_day.param << " ";
-        std::cout << good_day.data << "\n";
+    rcv_len = recvfrom(state.socket, buffer, BSIZE, 0, (struct sockaddr *) &server_address, &addrlen);
+    if (rcv_len < 0) {
+        if (rcv_len != -1 ||
+            (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINPROGRESS)) {
+            /* not caused by timeout */
+            throw std::runtime_error("read");
+        }
+    } else {
+        CMPLX_CMD good_day(buffer, rcv_len);
+        server_messages.push_back({inet_ntoa(server_address.sin_addr), good_day.data, good_day.param});
     }
 }
 
-void handle_client_command(const std::smatch &match, client_state &state) {
+void send_command(client_state &state, client_options &options) {
+    /* TODO sprawdzanie seq */
+    uint64_t cmd_seq = send_simple_message(state, "HELLO", "");
+
+    /* TODO sprawdzić czy wiadomość jest poprawna, bo będą błędy przy deserializacji */
+    char buffer[BSIZE];
+
+    std::vector<server_info> server_infos;
+    chr::system_clock::time_point start_point = chr::system_clock::now();
+    std::chrono::seconds timeout(options.TIMEOUT);
+    chr::system_clock::time_point end_point = start_point + timeout;
+    struct timeval wait_time{};
+    for (;;) {
+        chr::system_clock::time_point current_time = chr::system_clock::now();
+        if (end_point < current_time) {
+            break;
+        } else {
+            discover_single_address(state, end_point, current_time, wait_time, buffer, server_infos);
+        }
+    }
+
+    for (server_info &info : server_infos) {
+        std::cout << "Found " << info.address << " (" << info.multicast_address << ") ";
+        std::cout << "with free space " << info.free_space << "\n";
+    }
+
+    /* revert socket timeout */
+    wait_time.tv_sec = 0;
+    wait_time.tv_usec = 0;
+    if (setsockopt(state.socket, SOL_SOCKET, SO_RCVTIMEO, (void *)&wait_time,
+                   sizeof wait_time) < 0) {
+        throw std::runtime_error("setsockopt");
+    }
+}
+
+void discover(client_state &state, client_options &options) {
+    send_command(state, options);
+}
+
+void search(client_state &state, client_options &options) {
+
+}
+
+void handle_client_command(const std::smatch &match, client_state &state, client_options &options) {
     std::string command, argument;
     if (match.size() == 1) {
         command = match[0];
         if (command == "discover") {
-            discover(state);
-        }
-        else if (command == "exit") {
+            discover(state, options);
+        } else if (command == "exit") {
             clean_up(state);
-        }
-        else {
+        } else {
             assert(false);
         }
-    }
-    else {
+    } else {
         command = match[1];
         argument = match[2];
+        if (command == "search") {
+
+        }
         std::cout << "command: " << command << ", argument" << argument << "\n";
     }
 }
 
-void client_loop(client_state &state) {
+void client_loop(client_state &state, client_options &options) {
     /* TODO co ze spacjami przed i po oraz np. z danymi "search " oraz "search" */
     static const std::regex discover_r("discover");
-    static const std::regex search_r("(search) (.*)");
-    static const std::regex fetch_r("(fetch) (.*)");
-    static const std::regex upload_r("(upload) (.*)");
-    static const std::regex remove_r("(remove) (.*)");
+    static const std::regex search_r("(search) ?(.*)");
+    static const std::regex fetch_r("(fetch) ?(.*)");
+    static const std::regex upload_r("(upload) ?(.*)");
+    static const std::regex remove_r("(remove) ?(.*)");
     static const std::regex exit_r("exit");
-    static const std::regex regexes[] = {discover_r, search_r, fetch_r,
+    static const std::regex expressions[] = {discover_r, search_r, fetch_r,
                                          upload_r, remove_r, exit_r};
 
     for (;;) {
@@ -171,17 +236,16 @@ void client_loop(client_state &state) {
         std::transform(line.begin(), line.end(), line.begin(), ::tolower);
         std::smatch match;
 
-        for (const std::regex &r : regexes) {
+        for (const std::regex &r : expressions) {
             if (std::regex_match(line, match, r)) {
-                handle_client_command(match, state);
+                handle_client_command(match, state, options);
                 break;
             }
         }
     }
 }
 
-void catch_signal(int s) {
-    std::cout << "signal received\n";
+void catch_signal(int) {
     clean_up(current_client_state);
 }
 
@@ -199,7 +263,7 @@ int main(int argc, char const *argv[]) {
         add_signal_handler();
         client_options options = read_options(argc, argv);
         initialize_connection(options, current_client_state);
-        client_loop(current_client_state);
+        client_loop(current_client_state, options);
         clean_up(current_client_state);
     }
     catch (const std::exception &exception) {

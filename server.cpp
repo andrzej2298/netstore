@@ -17,6 +17,12 @@ std::size_t MAX_SPACE_DEFAULT = 52428800;
 std::size_t TIMEOUT_DEFAULT = 5;
 std::size_t TIMEOUT_MAX = 300;
 
+struct server_options;
+struct server_state;
+struct file_info;
+
+using file_infos = std::vector<file_info>;
+
 struct server_options {
     std::string MCAST_ADDR = "";
     int CMD_PORT = 0;
@@ -29,6 +35,12 @@ struct server_state {
     uint64_t available_space = 0;
     int socket = 0;
     struct ip_mreq ip_mreq{};
+    file_infos files;
+};
+
+struct file_info {
+    std::string name;
+    std::size_t size;
 };
 
 server_state current_server_state{};
@@ -67,20 +79,17 @@ void index_files(const server_options &options, server_state &state) {
     state.available_space = options.MAX_SPACE;
 
     if (fs::exists(dir_path) && fs::is_directory(dir_path)) {
-        try {
-            std::vector<fs::path> files;
+        std::vector<fs::path> files;
 
-            for (fs::directory_iterator it(dir_path); it != fs::directory_iterator(); ++it) {
-                if (fs::is_regular_file(it->path())) {
-                    std::size_t current_file_size = file_size(it->path());
-                    std::cout << *it << " " << current_file_size << "\n";
-                    assert(state.available_space > current_file_size);
-                    state.available_space -= current_file_size;
-                }
+        for (fs::directory_iterator it(dir_path); it != fs::directory_iterator(); ++it) {
+            if (fs::is_regular_file(it->path())) {
+                fs::path file_path = it->path();
+                const std::string &current_file = file_path.string();
+                std::size_t current_file_size = file_size(file_path);
+                state.files.push_back({current_file, current_file_size});
+                assert(state.available_space > current_file_size);
+                state.available_space -= current_file_size;
             }
-        }
-        catch (const fs::filesystem_error &err) {
-            std::cout << err.what();
         }
     } else {
         throw std::invalid_argument("wrong directory");
@@ -141,7 +150,7 @@ void read_requests(server_options &options, server_state &state) {
 
             CMPLX_CMD good_day("GOOD_DAY", request.cmd_seq, state.available_space, options.MCAST_ADDR);
             ssize_t sent = sendto(state.socket, good_day.serialized, good_day.serialized_length, 0,
-                       (struct sockaddr *) &client_address, addrlen);
+                                  (struct sockaddr *) &client_address, addrlen);
             if (sent != good_day.serialized_length) {
                 throw std::runtime_error("write");
             }
@@ -158,8 +167,7 @@ void clean_up(server_state &state) {
     close(state.socket);
 }
 
-void catch_signal(int s) {
-    std::cout << "signal received\n";
+void catch_signal(int) {
     clean_up(current_server_state);
     exit(0);
 }
@@ -178,12 +186,10 @@ int main(int argc, char const *argv[]) {
         add_signal_handler();
         server_options options = read_options(argc, argv);
         index_files(options, current_server_state);
-        std::cerr << current_server_state.available_space << "\n";
         initialize_connection(options, current_server_state);
         read_requests(options, current_server_state);
         clean_up(current_server_state);
     } catch (const std::exception &e) {
-
         std::cerr << e.what() << "\n" << strerror(errno) << "\n";
     }
 }

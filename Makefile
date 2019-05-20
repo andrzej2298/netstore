@@ -3,10 +3,10 @@ CPPFLAGS=-std=c++17 -Wall -Wextra -g -lboost_program_options -lboost_system -lbo
 
 all: netstore-client netstore-server
 
-netstore-client: client.cpp
+netstore-client: client.cpp connection.h
 	$(CXX) $(CPPFLAGS) $< -o $@
 
-netstore-server: server.cpp
+netstore-server: server.cpp connection.h
 	$(CXX) $(CPPFLAGS) $< -o $@
 
 clean:

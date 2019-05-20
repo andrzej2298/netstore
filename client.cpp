@@ -38,10 +38,14 @@ struct client_state {
     struct sockaddr_in remote_address{};
 };
 
-struct server_info {
+struct simple_command {
     std::string address;
-    std::string multicast_address;
-    uint64_t free_space;
+    SIMPL_CMD command;
+};
+
+struct complex_command {
+    std::string address;
+    CMPLX_CMD command;
 };
 
 client_state current_client_state{};
@@ -116,7 +120,7 @@ void initialize_connection(const client_options &options, client_state &state) {
     }
 }
 
-uint64_t send_simple_message(client_state &state, std::string cmd, std::string data) {
+uint64_t send_simple_message(client_state &state, const std::string &cmd, const std::string &data) {
     /* TODO z czy bez nawiasów */
     uint64_t cmd_seq = get_cmd_seq();
     SIMPL_CMD hello(cmd, cmd_seq, data);
@@ -129,7 +133,7 @@ uint64_t send_simple_message(client_state &state, std::string cmd, std::string d
 
 void discover_single_address(client_state &state, const chr::system_clock::time_point &end_point,
         const chr::system_clock::time_point &current_time, struct timeval &wait_time, char *buffer,
-        std::vector<server_info> &server_messages) {
+        std::vector<simple_command> &server_messages) {
     struct sockaddr_in server_address{};
     socklen_t addrlen = sizeof server_address;
     ssize_t rcv_len;
@@ -162,7 +166,7 @@ void send_command(client_state &state, client_options &options) {
     /* TODO sprawdzić czy wiadomość jest poprawna, bo będą błędy przy deserializacji */
     char buffer[BSIZE];
 
-    std::vector<server_info> server_infos;
+    std::vector<simple_command> server_infos;
     chr::system_clock::time_point start_point = chr::system_clock::now();
     std::chrono::seconds timeout(options.TIMEOUT);
     chr::system_clock::time_point end_point = start_point + timeout;
@@ -176,7 +180,7 @@ void send_command(client_state &state, client_options &options) {
         }
     }
 
-    for (server_info &info : server_infos) {
+    for (simple_command &info : server_infos) {
         std::cout << "Found " << info.address << " (" << info.multicast_address << ") ";
         std::cout << "with free space " << info.free_space << "\n";
     }
@@ -198,6 +202,10 @@ void search(client_state &state, client_options &options) {
 
 }
 
+void remove(client_state &state, client_options &options, const std::string &argument) {
+    send_simple_message(state, "DEL", argument);
+}
+
 void handle_client_command(const std::smatch &match, client_state &state, client_options &options) {
     std::string command, argument;
     if (match.size() == 1) {
@@ -215,7 +223,10 @@ void handle_client_command(const std::smatch &match, client_state &state, client
         if (command == "search") {
 
         }
-        std::cout << "command: " << command << ", argument" << argument << "\n";
+        else if (command == "remove") {
+            remove(state, options, argument);
+        }
+        std::cout << "command: " << command << ", argument " << argument << "\n";
     }
 }
 
@@ -225,7 +236,7 @@ void client_loop(client_state &state, client_options &options) {
     static const std::regex search_r("(search) ?(.*)");
     static const std::regex fetch_r("(fetch) ?(.*)");
     static const std::regex upload_r("(upload) ?(.*)");
-    static const std::regex remove_r("(remove) ?(.*)");
+    static const std::regex remove_r("(remove) (.*)");
     static const std::regex exit_r("exit");
     static const std::regex expressions[] = {discover_r, search_r, fetch_r,
                                          upload_r, remove_r, exit_r};

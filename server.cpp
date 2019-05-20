@@ -21,7 +21,7 @@ struct server_options;
 struct server_state;
 struct file_info;
 
-using file_infos = std::vector<file_info>;
+using file_infos = std::vector<fs::path>;
 
 struct server_options {
     std::string MCAST_ADDR = "";
@@ -36,11 +36,6 @@ struct server_state {
     int socket = 0;
     struct ip_mreq ip_mreq{};
     file_infos files;
-};
-
-struct file_info {
-    std::string name;
-    std::size_t size;
 };
 
 server_state current_server_state{};
@@ -84,14 +79,14 @@ void index_files(const server_options &options, server_state &state) {
         for (fs::directory_iterator it(dir_path); it != fs::directory_iterator(); ++it) {
             if (fs::is_regular_file(it->path())) {
                 fs::path file_path = it->path();
-                const std::string &current_file = file_path.string();
                 std::size_t current_file_size = file_size(file_path);
-                state.files.push_back({current_file, current_file_size});
+                state.files.push_back(file_path);
                 assert(state.available_space > current_file_size);
                 state.available_space -= current_file_size;
             }
         }
-    } else {
+    }
+    else {
         throw std::invalid_argument("wrong directory");
     }
 }
@@ -117,6 +112,8 @@ void initialize_connection(const server_options &options, server_state &state) {
         throw std::runtime_error("setsockopt");
     }
 
+    set_socket_option(state.socket, 1, SOL_SOCKET, SO_REUSEADDR, "reuseaddr");
+
     /* podpięcie się pod lokalny adres i port */
     local_address.sin_family = AF_INET;
     local_address.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -124,7 +121,22 @@ void initialize_connection(const server_options &options, server_state &state) {
     if (bind(state.socket, (struct sockaddr *) &local_address, sizeof local_address) < 0) {
         throw std::runtime_error("bind");
     }
+}
 
+void remove(server_options &options, server_state &state, const std::string &file_name) {
+    auto it = state.files.begin();
+
+    for (; (it != state.files.end()) && (it->filename().string() != file_name); ++it) {}
+    if (it != state.files.end()) {
+        std::cout << it->filename().string() << "\n";
+        state.available_space += it->size();
+        fs::remove(*it);
+        state.files.erase(it);
+    }
+}
+
+bool command_equal(const SIMPL_CMD &request, const std::string &command) {
+    return request.cmd.substr(0, command.length()) == command;
 }
 
 void read_requests(server_options &options, server_state &state) {
@@ -141,18 +153,28 @@ void read_requests(server_options &options, server_state &state) {
         if (rcv_len < 0) {
             printf("read %zd bytes\n", rcv_len);
             throw std::runtime_error("read");
-        } else {
+        }
+        else {
             printf("read %zd bytes: %.*s\n", rcv_len, (int) rcv_len, buffer);
             SIMPL_CMD request(buffer, rcv_len);
-            std::cout << request.cmd << " " << request.cmd_seq << "\n";
-            std::cout << "port: " << htons(client_address.sin_port) << "\n";
-            std::cout << "addr: " << inet_ntoa(client_address.sin_addr) << "\n";
+            std::string cmd(buffer);
+            if (command_equal(request, "HELLO")) {
+                std::cout << request.cmd << " " << request.cmd_seq << "\n";
+                std::cout << "port: " << htons(client_address.sin_port) << "\n";
+                std::cout << "addr: " << inet_ntoa(client_address.sin_addr) << "\n";
 
-            CMPLX_CMD good_day("GOOD_DAY", request.cmd_seq, state.available_space, options.MCAST_ADDR);
-            ssize_t sent = sendto(state.socket, good_day.serialized, good_day.serialized_length, 0,
-                                  (struct sockaddr *) &client_address, addrlen);
-            if (sent != good_day.serialized_length) {
-                throw std::runtime_error("write");
+                CMPLX_CMD good_day("GOOD_DAY", request.cmd_seq, state.available_space, options.MCAST_ADDR);
+                ssize_t sent = sendto(state.socket, good_day.serialized, good_day.serialized_length, 0,
+                                      (struct sockaddr *) &client_address, addrlen);
+                if (sent != good_day.serialized_length) {
+                    throw std::runtime_error("write");
+                }
+            }
+            else if (command_equal(request, "DEL")) {
+                remove(options, state, request.data);
+            }
+            else {
+                assert(false);
             }
         }
     }

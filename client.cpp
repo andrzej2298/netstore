@@ -38,7 +38,7 @@ struct client_state {
     struct sockaddr_in remote_address{};
 };
 
-struct simple_command {
+struct command {
     std::string address;
     SIMPL_CMD command;
 };
@@ -131,9 +131,10 @@ uint64_t send_simple_message(client_state &state, const std::string &cmd, const 
     }
 }
 
-void discover_single_address(client_state &state, const chr::system_clock::time_point &end_point,
-        const chr::system_clock::time_point &current_time, struct timeval &wait_time, char *buffer,
-        std::vector<simple_command> &server_messages) {
+void receive_timeouted_message(client_state &state, const chr::system_clock::time_point &end_point,
+                               const chr::system_clock::time_point &current_time, struct timeval &wait_time,
+                               char *buffer,
+                               std::vector<complex_command> &server_messages) {
     struct sockaddr_in server_address{};
     socklen_t addrlen = sizeof server_address;
     ssize_t rcv_len;
@@ -154,19 +155,14 @@ void discover_single_address(client_state &state, const chr::system_clock::time_
             throw std::runtime_error("read");
         }
     } else {
-        CMPLX_CMD good_day(buffer, rcv_len);
-        server_messages.push_back({inet_ntoa(server_address.sin_addr), good_day.data, good_day.param});
+        server_messages.push_back({inet_ntoa(server_address.sin_addr), {buffer, rcv_len}});
     }
 }
 
-void send_command(client_state &state, client_options &options) {
-    /* TODO sprawdzanie seq */
-    uint64_t cmd_seq = send_simple_message(state, "HELLO", "");
-
-    /* TODO sprawdzić czy wiadomość jest poprawna, bo będą błędy przy deserializacji */
+void receive_timeouted_messages(client_state &state, client_options &options, std::vector<complex_command> &server_messages) {
+    /* TODO sprawdzić czy wiadomość jest poprawna (np. długość), bo będą błędy przy deserializacji */
     char buffer[BSIZE];
 
-    std::vector<simple_command> server_infos;
     chr::system_clock::time_point start_point = chr::system_clock::now();
     std::chrono::seconds timeout(options.TIMEOUT);
     chr::system_clock::time_point end_point = start_point + timeout;
@@ -176,13 +172,8 @@ void send_command(client_state &state, client_options &options) {
         if (end_point < current_time) {
             break;
         } else {
-            discover_single_address(state, end_point, current_time, wait_time, buffer, server_infos);
+            receive_timeouted_message(state, end_point, current_time, wait_time, buffer, server_messages);
         }
-    }
-
-    for (simple_command &info : server_infos) {
-        std::cout << "Found " << info.address << " (" << info.multicast_address << ") ";
-        std::cout << "with free space " << info.free_space << "\n";
     }
 
     /* revert socket timeout */
@@ -195,7 +186,15 @@ void send_command(client_state &state, client_options &options) {
 }
 
 void discover(client_state &state, client_options &options) {
-    send_command(state, options);
+    /* TODO sprawdzanie seq */
+    uint64_t cmd_seq = send_simple_message(state, "HELLO", "");
+    std::vector<complex_command> server_messages;
+    receive_timeouted_messages(state, options, server_messages);
+
+    for (complex_command &info : server_messages) {
+        std::cout << "Found " << info.address << " (" << info.command.data << ") ";
+        std::cout << "with free space " << info.command.param << "\n";
+    }
 }
 
 void search(client_state &state, client_options &options) {
@@ -232,11 +231,12 @@ void handle_client_command(const std::smatch &match, client_state &state, client
 
 void client_loop(client_state &state, client_options &options) {
     /* TODO co ze spacjami przed i po oraz np. z danymi "search " oraz "search" */
+    /* TODO czy na pewno te spacje, plusy i gwiazdki są dobrze obsłużone */
     static const std::regex discover_r("discover");
     static const std::regex search_r("(search) ?(.*)");
     static const std::regex fetch_r("(fetch) ?(.*)");
     static const std::regex upload_r("(upload) ?(.*)");
-    static const std::regex remove_r("(remove) (.*)");
+    static const std::regex remove_r("(remove) (.+)");
     static const std::regex exit_r("exit");
     static const std::regex expressions[] = {discover_r, search_r, fetch_r,
                                          upload_r, remove_r, exit_r};

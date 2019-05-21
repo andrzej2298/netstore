@@ -2,9 +2,11 @@
 #include <iterator>
 #include <cstring>
 #include <sys/socket.h>
+#include <netinet/in.h>
 
 #define CMD_LEN 10
 #define BSIZE 256
+#define MIN_CMD_LEN (CMD_LEN + sizeof(uint64_t))
 
 void serialize_string(char *to, const std::string &from, std::size_t &i, std::size_t n);
 
@@ -22,8 +24,10 @@ struct SIMPL_CMD {
     char *serialized;
     ssize_t serialized_length;
 
+    SIMPL_CMD(const char *input, ssize_t length);
     SIMPL_CMD(std::string _cmd, uint64_t _cmd_seq, std::string _data);
-    SIMPL_CMD(const char *input, std::size_t length);
+    SIMPL_CMD(SIMPL_CMD &other);
+    SIMPL_CMD(SIMPL_CMD &&other) noexcept;
     ~SIMPL_CMD();
 
     void deserialize();
@@ -41,6 +45,8 @@ struct CMPLX_CMD {
 
     CMPLX_CMD(std::string _cmd, uint64_t _cmd_seq, uint64_t _param, std::string _data);
     CMPLX_CMD(const char *input, ssize_t length);
+    CMPLX_CMD(CMPLX_CMD &other);
+    CMPLX_CMD(CMPLX_CMD &&other) noexcept;
     ~CMPLX_CMD();
 
     void deserialize();
@@ -49,3 +55,5 @@ struct CMPLX_CMD {
 
 
 void set_socket_option(int socket, int optval, int level, int optname, const std::string &error_message);
+uint64_t send_simple_message(int socket, const struct sockaddr_in &address, const std::string &cmd, const std::string &data, uint64_t cmd_seq);
+uint64_t send_complex_message(int socket, const struct sockaddr_in &address, const std::string &cmd, const std::string &data, uint64_t cmd_seq, uint64_t param);

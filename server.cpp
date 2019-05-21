@@ -1,5 +1,6 @@
 #include <iostream>
 #include <vector>
+#include <regex>
 #include <cassert>
 #include <boost/filesystem.hpp>
 #include <boost/program_options.hpp>
@@ -39,6 +40,41 @@ struct server_state {
 };
 
 server_state current_server_state{};
+
+
+void clean_up(server_state &state) {
+    /* dropping multicast group membership */
+    if (setsockopt(state.socket, IPPROTO_IP, IP_DROP_MEMBERSHIP,
+                   (void *) &state.ip_mreq, sizeof state.ip_mreq) < 0) {
+        throw std::runtime_error("setsockopt");
+    }
+    close(state.socket);
+}
+
+void catch_signal(int) {
+    clean_up(current_server_state);
+    exit(0);
+}
+
+void add_signal_handlers() {
+    struct sigaction sigint_handler{};
+    sigint_handler.sa_handler = catch_signal;
+    sigemptyset(&sigint_handler.sa_mask);
+    sigint_handler.sa_flags = 0;
+
+    if (sigaction(SIGINT, &sigint_handler, nullptr) == -1) {
+        throw std::runtime_error("sigaction");
+    }
+
+    struct sigaction sigchld_handler{};
+    sigchld_handler.sa_handler = SIG_IGN;
+    sigemptyset(&sigchld_handler.sa_mask);
+    sigchld_handler.sa_flags = 0;
+
+    if (sigaction(SIGCHLD, &sigchld_handler, nullptr)) {
+        throw std::runtime_error("sigaction");
+    }
+}
 
 server_options read_options(int argc, char const *argv[]) {
     po::options_description description("Allowed options");
@@ -92,16 +128,15 @@ void index_files(const server_options &options, server_state &state) {
 }
 
 void initialize_connection(const server_options &options, server_state &state) {
-    /* zmienne i struktury opisujące gniazda */
     struct sockaddr_in local_address{};
 
-    /* otworzenie gniazda */
+    /* opening socket */
     state.socket = socket(AF_INET, SOCK_DGRAM, 0);
     if (state.socket < 0) {
         throw std::runtime_error("socket");
     }
 
-    /* podpięcie się do grupy rozsyłania (ang. multicast) */
+    /* joining the multicast group */
     state.ip_mreq.imr_interface.s_addr = htonl(INADDR_ANY);
     if (inet_aton(options.MCAST_ADDR.c_str(), &state.ip_mreq.imr_multiaddr) == 0) {
         throw std::runtime_error("inet_aton");
@@ -114,7 +149,7 @@ void initialize_connection(const server_options &options, server_state &state) {
 
     set_socket_option(state.socket, 1, SOL_SOCKET, SO_REUSEADDR, "reuseaddr");
 
-    /* podpięcie się pod lokalny adres i port */
+    /* local address and port */
     local_address.sin_family = AF_INET;
     local_address.sin_addr.s_addr = htonl(INADDR_ANY);
     local_address.sin_port = htons(options.CMD_PORT);
@@ -123,10 +158,18 @@ void initialize_connection(const server_options &options, server_state &state) {
     }
 }
 
-void remove(server_options &options, server_state &state, const std::string &file_name) {
+bool command_equal(const SIMPL_CMD &request, const std::string &command) {
+    return request.cmd.substr(0, command.length()) == command;
+}
+
+void discover(server_state &state, server_options &options, const struct sockaddr_in &client_address, SIMPL_CMD &request) {
+    send_complex_message(state.socket, client_address, "GOOD_DAY", options.MCAST_ADDR, request.cmd_seq, state.available_space);
+}
+
+void remove(server_options &options, server_state &state, const std::string &target_file_name) {
     auto it = state.files.begin();
 
-    for (; (it != state.files.end()) && (it->filename().string() != file_name); ++it) {}
+    for (; (it != state.files.end()) && (it->filename().string() != target_file_name); ++it) {}
     if (it != state.files.end()) {
         std::cout << it->filename().string() << "\n";
         state.available_space += it->size();
@@ -135,83 +178,105 @@ void remove(server_options &options, server_state &state, const std::string &fil
     }
 }
 
-bool command_equal(const SIMPL_CMD &request, const std::string &command) {
-    return request.cmd.substr(0, command.length()) == command;
+void list(server_options &options, server_state &state, const struct sockaddr_in &client_address, SIMPL_CMD &request) {
+    std::string &target_file_name = request.data;
+    std::vector<std::string> results;
+    for (const fs::path &file : state.files) {
+        const std::string &file_name = file.filename().string();
+        if (file_name.find(target_file_name) != std::string::npos) {
+            results.push_back(file_name);
+        }
+    }
+
+    std::string data;
+    if (!results.empty()) {
+        data = results[0];
+        for (const std::string &file_name : results) {
+            data += "\n" + file_name;
+        }
+    }
+
+    /* TODO many messages if list too big */
+    send_simple_message(state.socket, client_address, "MY_LIST", data, request.cmd_seq);
+}
+
+void initialize_file_transfer(server_options &options, server_state &state, const struct sockaddr_in &client_address, SIMPL_CMD &request) {
+    clean_up(state);
+}
+
+void fetch(server_options &options, server_state &state, const struct sockaddr_in &client_address, SIMPL_CMD &request) {
+    for (auto &file : state.files) {
+        if (file.filename().string() == request.data) {
+            switch (fork())  {
+                case -1:
+                    throw std::runtime_error("fork");
+                case 0:
+                    initialize_file_transfer(options, state, client_address, request);
+                    break;
+                default:
+                    std::cout << "parent\n";
+                    break;
+            }
+            return;
+        }
+    }
 }
 
 void read_requests(server_options &options, server_state &state) {
-    /* zmienne obsługujące komunikację */
+    /* data received */
     char buffer[BSIZE];
-    memset(buffer, 0, BSIZE);
     ssize_t rcv_len;
     struct sockaddr_in client_address{};
     socklen_t addrlen = sizeof client_address;
 
     for (;;) {
-        /* czytanie tego, co odebrano */
+        /* read */
         rcv_len = recvfrom(state.socket, buffer, sizeof buffer, 0, (struct sockaddr *) &client_address, &addrlen);
         if (rcv_len < 0) {
-            printf("read %zd bytes\n", rcv_len);
             throw std::runtime_error("read");
         }
         else {
-            printf("read %zd bytes: %.*s\n", rcv_len, (int) rcv_len, buffer);
-            SIMPL_CMD request(buffer, rcv_len);
-            std::string cmd(buffer);
-            if (command_equal(request, "HELLO")) {
-                std::cout << request.cmd << " " << request.cmd_seq << "\n";
-                std::cout << "port: " << htons(client_address.sin_port) << "\n";
-                std::cout << "addr: " << inet_ntoa(client_address.sin_addr) << "\n";
+            if (rcv_len < MIN_CMD_LEN) {
+                /* TODO odnotować */
+                continue;
+            }
 
-                CMPLX_CMD good_day("GOOD_DAY", request.cmd_seq, state.available_space, options.MCAST_ADDR);
-                ssize_t sent = sendto(state.socket, good_day.serialized, good_day.serialized_length, 0,
-                                      (struct sockaddr *) &client_address, addrlen);
-                if (sent != good_day.serialized_length) {
-                    throw std::runtime_error("write");
-                }
+            SIMPL_CMD request(buffer, rcv_len);
+            std::cout << request.cmd << " " << request.cmd_seq << "\n";
+            std::cout << "port: " << htons(client_address.sin_port) << "\n";
+            std::cout << "addr: " << inet_ntoa(client_address.sin_addr) << "\n";
+//            std::string cmd(buffer);
+
+            if (command_equal(request, "HELLO")) {
+                discover(state, options, client_address, request);
             }
             else if (command_equal(request, "DEL")) {
                 remove(options, state, request.data);
             }
+            else if (command_equal(request, "LIST")) {
+                list(options, state, client_address, request);
+            }
+            else if (command_equal(request, "GET")) {
+                fetch(options, state, client_address, request);
+            }
             else {
+                /* TODO tak naprawdę to chyba drop packet */
                 assert(false);
             }
         }
     }
 }
 
-void clean_up(server_state &state) {
-    /* w taki sposób można odpiąć się od grupy rozsyłania */
-    if (setsockopt(state.socket, IPPROTO_IP, IP_DROP_MEMBERSHIP,
-                   (void *) &state.ip_mreq, sizeof state.ip_mreq) < 0) {
-        throw std::runtime_error("setsockopt");
-    }
-    close(state.socket);
-}
-
-void catch_signal(int) {
-    clean_up(current_server_state);
-    exit(0);
-}
-
-void add_signal_handler() {
-    struct sigaction signal_handler{};
-    signal_handler.sa_handler = catch_signal;
-    sigemptyset(&signal_handler.sa_mask);
-    signal_handler.sa_flags = 0;
-
-    sigaction(SIGINT, &signal_handler, nullptr);
-}
 
 int main(int argc, char const *argv[]) {
     try {
-        add_signal_handler();
+        add_signal_handlers();
         server_options options = read_options(argc, argv);
         index_files(options, current_server_state);
         initialize_connection(options, current_server_state);
         read_requests(options, current_server_state);
         clean_up(current_server_state);
     } catch (const std::exception &e) {
-        std::cerr << e.what() << "\n" << strerror(errno) << "\n";
+        std::cerr << "error: " << e.what() << "\n" << strerror(errno) << "\n";
     }
 }

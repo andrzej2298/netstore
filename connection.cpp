@@ -37,13 +37,28 @@ SIMPL_CMD::SIMPL_CMD(std::string _cmd, uint64_t _cmd_seq, std::string _data)
     serialize();
 }
 
-SIMPL_CMD::SIMPL_CMD(const char *input, std::size_t length) {
+SIMPL_CMD::SIMPL_CMD(const char *input, ssize_t length) {
     serialized = new char[length];
     memcpy(serialized, input, length);
     serialized_length = length;
 
     deserialize();
 }
+
+SIMPL_CMD::SIMPL_CMD(SIMPL_CMD &other) {
+    serialized_length = other.serialized_length;
+    serialized = new char[other.serialized_length];
+    memcpy(serialized, other.serialized, serialized_length);
+    deserialize();
+}
+
+SIMPL_CMD::SIMPL_CMD(SIMPL_CMD &&other) noexcept {
+    serialized_length = other.serialized_length;
+    serialized = new char[other.serialized_length];
+    memcpy(serialized, other.serialized, serialized_length);
+    deserialize();
+}
+
 
 SIMPL_CMD::~SIMPL_CMD() {
     delete[] serialized;
@@ -86,6 +101,20 @@ CMPLX_CMD::CMPLX_CMD(const char *input, ssize_t length) {
     deserialize();
 }
 
+CMPLX_CMD::CMPLX_CMD(CMPLX_CMD &other) {
+    serialized_length = other.serialized_length;
+    serialized = new char[other.serialized_length];
+    memcpy(serialized, other.serialized, serialized_length);
+    deserialize();
+}
+
+CMPLX_CMD::CMPLX_CMD(CMPLX_CMD &&other) noexcept {
+    serialized_length = other.serialized_length;
+    serialized = new char[other.serialized_length];
+    memcpy(serialized, other.serialized, serialized_length);
+    deserialize();
+}
+
 CMPLX_CMD::~CMPLX_CMD() {
     delete[] serialized;
 }
@@ -117,4 +146,23 @@ void set_socket_option(int socket, int optval, int level, int optname, const std
     if (setsockopt(socket, level, optname, (void *) &optval, sizeof optval) < 0) {
         throw std::runtime_error(error_message);
     }
+}
+
+uint64_t send_simple_message(int socket, const struct sockaddr_in &address, const std::string &cmd, const std::string &data, uint64_t cmd_seq) {
+    /* TODO z czy bez nawiasów */
+    SIMPL_CMD command(cmd, cmd_seq, data);
+    if (sendto(socket, command.serialized, command.serialized_length, 0,
+               (struct sockaddr *) &address, sizeof address) != command.serialized_length) {
+        throw std::runtime_error("write");
+    }
+    return cmd_seq;
+}
+
+uint64_t send_complex_message(int socket, const struct sockaddr_in &address, const std::string &cmd, const std::string &data, uint64_t cmd_seq, uint64_t param) {
+    CMPLX_CMD command(cmd, cmd_seq, param, data);
+    if (sendto(socket, command.serialized, command.serialized_length, 0,
+                          (struct sockaddr *) &address, sizeof address) != command.serialized_length) {
+        throw std::runtime_error("write");
+    }
+    return cmd_seq;
 }

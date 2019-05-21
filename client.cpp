@@ -1,5 +1,6 @@
 /* TODO
  * - sprawdzanie cmd_seq
+ * - dzielenie listy plików
  * */
 
 #include <iostream>
@@ -33,19 +34,16 @@ struct client_options {
     unsigned int TIMEOUT = 0;
 };
 
+template<typename T>
+struct message {
+    struct sockaddr_in address;
+    T command;
+};
+
 struct client_state {
     int socket{};
     struct sockaddr_in remote_address{};
-};
-
-struct command {
-    std::string address;
-    SIMPL_CMD command;
-};
-
-struct complex_command {
-    std::string address;
-    CMPLX_CMD command;
+    std::vector<message<SIMPL_CMD>> previous_search;
 };
 
 client_state current_client_state{};
@@ -88,6 +86,13 @@ client_options read_options(int argc, char const *argv[]) {
     return options;
 }
 
+boost::tokenizer<boost::char_separator<char>> tokenize(const message<SIMPL_CMD> &message) {
+    /* splitting the file list on '\n' */
+    boost::char_separator<char> newline("\n");
+    boost::tokenizer<boost::char_separator<char>> t(message.command.data, newline);
+    return t;
+}
+
 void initialize_connection(const client_options &options, client_state &state) {
     /* socket info */
     struct sockaddr_in local_address{};
@@ -98,7 +103,7 @@ void initialize_connection(const client_options &options, client_state &state) {
         throw std::runtime_error("socket");
     }
 
-    /* podpięcie się pod lokalny adres i port */
+    /* host address */
     local_address.sin_family = AF_INET;
     local_address.sin_addr.s_addr = htonl(INADDR_ANY);
     local_address.sin_port = htons(0);
@@ -112,7 +117,7 @@ void initialize_connection(const client_options &options, client_state &state) {
     /* setting TTL */
     set_socket_option(state.socket, TTL_VALUE, IPPROTO_IP, IP_MULTICAST_TTL, "setsockopt multicast ttl");
 
-    /* ustawienie adresu i portu odbiorcy */
+    /* multicast address */
     state.remote_address.sin_family = AF_INET;
     state.remote_address.sin_port = htons(options.CMD_PORT);
     if (inet_aton(options.MCAST_ADDR.c_str(), &state.remote_address.sin_addr) == 0) {
@@ -120,21 +125,15 @@ void initialize_connection(const client_options &options, client_state &state) {
     }
 }
 
-uint64_t send_simple_message(client_state &state, const std::string &cmd, const std::string &data) {
-    /* TODO z czy bez nawiasów */
-    uint64_t cmd_seq = get_cmd_seq();
-    SIMPL_CMD hello(cmd, cmd_seq, data);
-    if (sendto(state.socket, hello.serialized, hello.serialized_length, 0,
-               (struct sockaddr *) &state.remote_address,
-               sizeof state.remote_address) != hello.serialized_length) {
-        throw std::runtime_error("write");
-    }
+uint64_t send_simple_client_message(client_state &state, const std::string &cmd, const std::string &data) {
+    return send_simple_message(state.socket, state.remote_address, cmd, data, get_cmd_seq());
 }
 
+template<typename T>
 void receive_timeouted_message(client_state &state, const chr::system_clock::time_point &end_point,
                                const chr::system_clock::time_point &current_time, struct timeval &wait_time,
                                char *buffer,
-                               std::vector<complex_command> &server_messages) {
+                               std::vector<message<T>> &server_messages) {
     struct sockaddr_in server_address{};
     socklen_t addrlen = sizeof server_address;
     ssize_t rcv_len;
@@ -142,7 +141,7 @@ void receive_timeouted_message(client_state &state, const chr::system_clock::tim
     chr::seconds sec = chr::duration_cast<chr::seconds>(remaining_time);
     wait_time.tv_sec = sec.count();
     wait_time.tv_usec = chr::duration_cast<chr::microseconds>(remaining_time - sec).count();
-    if (setsockopt(state.socket, SOL_SOCKET, SO_RCVTIMEO, (void *)&wait_time,
+    if (setsockopt(state.socket, SOL_SOCKET, SO_RCVTIMEO, (void *) &wait_time,
                    sizeof wait_time) < 0) {
         throw std::runtime_error("setsockopt");
     }
@@ -154,14 +153,19 @@ void receive_timeouted_message(client_state &state, const chr::system_clock::tim
             /* not caused by timeout */
             throw std::runtime_error("read");
         }
-    } else {
-        server_messages.push_back({inet_ntoa(server_address.sin_addr), {buffer, rcv_len}});
+    }
+    else {
+//        server_messages.push_back({inet_ntoa(server_address.sin_addr), {buffer, rcv_len}});
+        server_messages.push_back({server_address, {buffer, rcv_len}});
     }
 }
 
-void receive_timeouted_messages(client_state &state, client_options &options, std::vector<complex_command> &server_messages) {
+template<typename T>
+void
+receive_timeouted_messages(client_state &state, client_options &options, std::vector<message<T>> &server_messages) {
     /* TODO sprawdzić czy wiadomość jest poprawna (np. długość), bo będą błędy przy deserializacji */
     char buffer[BSIZE];
+
 
     chr::system_clock::time_point start_point = chr::system_clock::now();
     std::chrono::seconds timeout(options.TIMEOUT);
@@ -171,7 +175,8 @@ void receive_timeouted_messages(client_state &state, client_options &options, st
         chr::system_clock::time_point current_time = chr::system_clock::now();
         if (end_point < current_time) {
             break;
-        } else {
+        }
+        else {
             receive_timeouted_message(state, end_point, current_time, wait_time, buffer, server_messages);
         }
     }
@@ -179,7 +184,7 @@ void receive_timeouted_messages(client_state &state, client_options &options, st
     /* revert socket timeout */
     wait_time.tv_sec = 0;
     wait_time.tv_usec = 0;
-    if (setsockopt(state.socket, SOL_SOCKET, SO_RCVTIMEO, (void *)&wait_time,
+    if (setsockopt(state.socket, SOL_SOCKET, SO_RCVTIMEO, (void *) &wait_time,
                    sizeof wait_time) < 0) {
         throw std::runtime_error("setsockopt");
     }
@@ -187,22 +192,54 @@ void receive_timeouted_messages(client_state &state, client_options &options, st
 
 void discover(client_state &state, client_options &options) {
     /* TODO sprawdzanie seq */
-    uint64_t cmd_seq = send_simple_message(state, "HELLO", "");
-    std::vector<complex_command> server_messages;
+    uint64_t cmd_seq = send_simple_client_message(state, "HELLO", "");
+    std::vector<message<CMPLX_CMD>> server_messages;
     receive_timeouted_messages(state, options, server_messages);
 
-    for (complex_command &info : server_messages) {
-        std::cout << "Found " << info.address << " (" << info.command.data << ") ";
+    for (auto &info : server_messages) {
+        std::cout << "Found " << inet_ntoa(info.address.sin_addr) << " (" << info.command.data << ") ";
         std::cout << "with free space " << info.command.param << "\n";
     }
 }
 
-void search(client_state &state, client_options &options) {
+void search(client_state &state, client_options &options, const std::string &argument) {
+    uint64_t cmd_seq = send_simple_client_message(state, "LIST", argument);
+    std::vector<message<SIMPL_CMD>> server_messages;
+    receive_timeouted_messages(state, options, server_messages);
 
+    for (auto &info : server_messages) {
+        std::string address(inet_ntoa(info.address.sin_addr));
+        auto t = tokenize(info);
+        for (auto it = t.begin(); it != t.end(); ++it) {
+            std::cout << *it << " ("<< address << ")" << "\n";
+        }
+    }
+
+    if (!state.previous_search.empty()) {
+        state.previous_search.clear();
+    }
+    for (message<SIMPL_CMD> &msg : server_messages) {
+        state.previous_search.emplace_back(message<SIMPL_CMD>(msg));
+    }
+}
+
+void fetch(client_state &state, client_options &options, const std::string &argument) {
+    for (auto &info : state.previous_search) {
+        auto t = tokenize(info);
+        for (auto it = t.begin(); it != t.end(); ++it) {
+            if (*it == argument) {
+                std::cout << *it << " " << inet_ntoa(info.address.sin_addr) << "\n";
+                send_simple_client_message(state, "GET", argument);
+                return;
+            }
+        }
+    }
+
+    std::cout << "File " << argument << " wasn't found\n";
 }
 
 void remove(client_state &state, client_options &options, const std::string &argument) {
-    send_simple_message(state, "DEL", argument);
+    uint64_t cmd_seq = send_simple_client_message(state, "DEL", argument);
 }
 
 void handle_client_command(const std::smatch &match, client_state &state, client_options &options) {
@@ -211,21 +248,29 @@ void handle_client_command(const std::smatch &match, client_state &state, client
         command = match[0];
         if (command == "discover") {
             discover(state, options);
-        } else if (command == "exit") {
+        }
+        else if (command == "exit") {
             clean_up(state);
-        } else {
+        }
+        else {
             assert(false);
         }
-    } else {
+    }
+    else {
         command = match[1];
         argument = match[2];
         if (command == "search") {
-
+            search(state, options, argument);
         }
         else if (command == "remove") {
             remove(state, options, argument);
         }
-        std::cout << "command: " << command << ", argument " << argument << "\n";
+        else if (command == "fetch") {
+            fetch(state, options, argument);
+        }
+        else {
+            assert(false);
+        }
     }
 }
 
@@ -234,12 +279,12 @@ void client_loop(client_state &state, client_options &options) {
     /* TODO czy na pewno te spacje, plusy i gwiazdki są dobrze obsłużone */
     static const std::regex discover_r("discover");
     static const std::regex search_r("(search) ?(.*)");
-    static const std::regex fetch_r("(fetch) ?(.*)");
+    static const std::regex fetch_r("(fetch) (.+)");
     static const std::regex upload_r("(upload) ?(.*)");
     static const std::regex remove_r("(remove) (.+)");
     static const std::regex exit_r("exit");
     static const std::regex expressions[] = {discover_r, search_r, fetch_r,
-                                         upload_r, remove_r, exit_r};
+                                             upload_r, remove_r, exit_r};
 
     for (;;) {
         std::string line;
@@ -260,7 +305,7 @@ void catch_signal(int) {
     clean_up(current_client_state);
 }
 
-void add_signal_handler() {
+void add_signal_handlers() {
     struct sigaction signal_handler{};
     signal_handler.sa_handler = catch_signal;
     sigemptyset(&signal_handler.sa_mask);
@@ -271,7 +316,7 @@ void add_signal_handler() {
 
 int main(int argc, char const *argv[]) {
     try {
-        add_signal_handler();
+        add_signal_handlers();
         client_options options = read_options(argc, argv);
         initialize_connection(options, current_client_state);
         client_loop(current_client_state, options);

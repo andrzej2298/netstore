@@ -8,8 +8,11 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <csignal>
+#include <netdb.h>
 
 #include "connection.h"
+
+#define QUEUE_LENGTH 1
 
 namespace po = boost::program_options;
 namespace fs = boost::filesystem;
@@ -40,18 +43,23 @@ struct server_state {
 };
 
 server_state current_server_state{};
-
+int parent_pid = getpid();
 
 void clean_up(server_state &state) {
-    /* dropping multicast group membership */
-    if (setsockopt(state.socket, IPPROTO_IP, IP_DROP_MEMBERSHIP,
-                   (void *) &state.ip_mreq, sizeof state.ip_mreq) < 0) {
-        throw std::runtime_error("setsockopt");
+    kill(-getpid(), SIGINT);
+
+    if (getpid() == parent_pid) {
+        /* dropping multicast group membership (only once) */
+        if (setsockopt(state.socket, IPPROTO_IP, IP_DROP_MEMBERSHIP,
+                       (void *) &state.ip_mreq, sizeof state.ip_mreq) < 0) {
+            throw std::runtime_error("setsockopt");
+        }
     }
     close(state.socket);
 }
 
 void catch_signal(int) {
+//    std::cout << "signal caught: " << getpid() << "\n";
     clean_up(current_server_state);
     exit(0);
 }
@@ -200,8 +208,74 @@ void list(server_options &options, server_state &state, const struct sockaddr_in
     send_simple_message(state.socket, client_address, "MY_LIST", data, request.cmd_seq);
 }
 
-void initialize_file_transfer(server_options &options, server_state &state, const struct sockaddr_in &client_address, SIMPL_CMD &request) {
-    clean_up(state);
+void initialize_file_transfer(server_options &options, server_state &state, const struct sockaddr_in &client_udp, SIMPL_CMD &request) {
+    struct addrinfo addr_hints;
+    struct addrinfo *addr_result;
+    int sock, msg_sock;
+    struct sockaddr_in server_tcp;
+    struct sockaddr_in client_tcp;
+    socklen_t client_tcp_len = sizeof client_tcp;
+    socklen_t server_tcp_len = sizeof server_tcp;
+
+    ssize_t len, snd_len;
+
+    /* IPv4 TCP socket */
+    sock = socket(PF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        throw std::runtime_error("socket");
+    }
+
+    server_tcp.sin_family = AF_INET;
+    server_tcp.sin_addr.s_addr = htonl(INADDR_ANY);
+    /* ephemeral port */
+    server_tcp.sin_port = htons(0);
+
+    if (bind(sock, (struct sockaddr *) &server_tcp, server_tcp_len) < 0) {
+        throw std::runtime_error("bind");
+    }
+    if (listen(sock, QUEUE_LENGTH) < 0) {
+        throw std::runtime_error("listen");
+    }
+    if (getsockname(sock, (struct sockaddr *)&server_tcp, &server_tcp_len) < 0){
+        throw std::runtime_error("getsockname");
+    }
+
+    std::cout << "port: " << server_tcp.sin_port << "\n";
+
+    std::cout << "accepting\n";
+
+    struct timeval wait_time{options.TIMEOUT, 0};
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(sock, &fds);
+    char buffer[BSIZE];
+
+    send_complex_message(state.socket, client_udp, "CONNECT_ME", request.data, request.cmd_seq, server_tcp.sin_port);
+
+    if (select(sock + 1, &fds, nullptr, nullptr, &wait_time)) {
+        client_tcp_len = sizeof(client_tcp);
+        msg_sock = accept(sock, (struct sockaddr *) &client_tcp, &client_tcp_len);
+        if (msg_sock < 0) {
+            throw std::runtime_error("accept");
+        }
+        snd_len = write(msg_sock, "ABC", 3);
+        if (snd_len != 3) {
+            throw std::runtime_error("writing to client socket");
+        }
+        printf("ending connection\n");
+        if (close(msg_sock) < 0)
+            throw std::runtime_error("close");
+    }
+    else {
+        std::cout << "not connected\n";
+    }
+    std::cout << "after accepting\n";
+
+
+    close(state.socket);
+    close(msg_sock);
+    std::cout << "child ending\n";
+    exit(0);
 }
 
 void fetch(server_options &options, server_state &state, const struct sockaddr_in &client_address, SIMPL_CMD &request) {

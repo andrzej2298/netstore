@@ -166,3 +166,11 @@ uint64_t send_complex_message(int socket, const struct sockaddr_in &address, con
     }
     return cmd_seq;
 }
+
+
+void set_socket_receive_timeout(int socket, struct timeval wait_time) {
+    if (setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, (void *) &wait_time,
+                   sizeof wait_time) < 0) {
+        throw std::runtime_error("setsockopt");
+    }
+}

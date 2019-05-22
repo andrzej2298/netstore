@@ -1,6 +1,7 @@
 /* TODO
  * - sprawdzanie cmd_seq
  * - dzielenie listy plików
+ * - sprawdzanie, czy pakiet ma poprawne polecenie
  * */
 
 #include <iostream>
@@ -16,6 +17,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 
 #include "connection.h"
 
@@ -141,10 +143,7 @@ void receive_timeouted_message(client_state &state, const chr::system_clock::tim
     chr::seconds sec = chr::duration_cast<chr::seconds>(remaining_time);
     wait_time.tv_sec = sec.count();
     wait_time.tv_usec = chr::duration_cast<chr::microseconds>(remaining_time - sec).count();
-    if (setsockopt(state.socket, SOL_SOCKET, SO_RCVTIMEO, (void *) &wait_time,
-                   sizeof wait_time) < 0) {
-        throw std::runtime_error("setsockopt");
-    }
+    set_socket_receive_timeout(state.socket, wait_time);
 
     rcv_len = recvfrom(state.socket, buffer, BSIZE, 0, (struct sockaddr *) &server_address, &addrlen);
     if (rcv_len < 0) {
@@ -228,8 +227,61 @@ void fetch(client_state &state, client_options &options, const std::string &argu
         auto t = tokenize(info);
         for (auto it = t.begin(); it != t.end(); ++it) {
             if (*it == argument) {
+                char buffer[BSIZE];
                 std::cout << *it << " " << inet_ntoa(info.address.sin_addr) << "\n";
                 send_simple_client_message(state, "GET", argument);
+                set_socket_receive_timeout(state.socket, {options.TIMEOUT, 0});
+
+                ssize_t rcv_len;
+                socklen_t addrlen = sizeof info.address;
+                rcv_len = recvfrom(state.socket, buffer, BSIZE, 0, (struct sockaddr *) &info.address, &addrlen);
+                if (rcv_len < 0) {
+                    if (rcv_len != -1 ||
+                        (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINPROGRESS)) {
+                        /* not caused by timeout */
+                        throw std::runtime_error("read");
+                    }
+                }
+                CMPLX_CMD message(buffer, rcv_len);
+                std::cout << "port: " << message.param << "\n";
+
+                int tcp_socket;
+//                struct addrinfo addr_hints;
+                struct addrinfo *addr_result;
+                struct sockaddr_in server_address{info.address};
+                server_address.sin_port = message.param;
+
+                // 'converting' host/port in string to struct addrinfo
+//                memset(&addr_hints, 0, sizeof(struct addrinfo));
+//                addr_hints.ai_family = AF_INET; // IPv4
+//                addr_hints.ai_socktype = SOCK_STREAM;
+//                addr_hints.ai_protocol = IPPROTO_TCP;
+
+//                if (getaddrinfo(inet_ntoa(info.address.sin_addr), std::to_string(message.param).c_str(),
+//                       &addr_hints, &addr_result) != 0) {
+//                    throw std::runtime_error("getaddrinfo");
+//                }
+
+                // initialize socket according to getaddrinfo results
+//                tcp_socket = socket(addr_result->ai_family, addr_result->ai_socktype, addr_result->ai_protocol);
+//                if (tcp_socket < 0)
+//                    throw std::runtime_error("socket");
+                tcp_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                if (tcp_socket < 0)
+                    throw std::runtime_error("socket");
+
+                // connect socket to the server
+                if (connect(tcp_socket, (struct sockaddr *) &server_address, sizeof server_address) < 0)
+                    throw std::runtime_error("connect");
+
+//                freeaddrinfo(addr_result);
+                memset(buffer, 0, BSIZE);
+                rcv_len = read(tcp_socket, buffer, sizeof(buffer) - 1);
+                if (rcv_len < 0) {
+                    throw std::runtime_error("read");
+                }
+                printf("read from socket: %zd bytes: %s\n", rcv_len, buffer);
+                close(tcp_socket); // socket would be closed anyway when the program ends
                 return;
             }
         }

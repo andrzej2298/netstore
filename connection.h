@@ -57,3 +57,6 @@ struct CMPLX_CMD {
 void set_socket_option(int socket, int optval, int level, int optname, const std::string &error_message);
 uint64_t send_simple_message(int socket, const struct sockaddr_in &address, const std::string &cmd, const std::string &data, uint64_t cmd_seq);
 uint64_t send_complex_message(int socket, const struct sockaddr_in &address, const std::string &cmd, const std::string &data, uint64_t cmd_seq, uint64_t param);
+uint64_t receive_complex_message(int socket, const struct sockaddr_in &address, const std::string &cmd, const std::string &data, uint64_t cmd_seq, uint64_t param);
+
+void set_socket_receive_timeout(int socket, struct timeval wait_time);

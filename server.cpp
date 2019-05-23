@@ -1,5 +1,5 @@
 #include <iostream>
-#include <vector>
+#include <list>
 #include <regex>
 #include <cassert>
 #include <boost/filesystem.hpp>
@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <csignal>
 #include <netdb.h>
+#include <fcntl.h>
 
 #include "connection.h"
 
@@ -40,6 +41,7 @@ struct server_state {
     int socket = 0;
     struct ip_mreq ip_mreq{};
     file_infos files;
+    server_infos servers;
 };
 
 server_state current_server_state{};
@@ -170,8 +172,10 @@ bool command_equal(const SIMPL_CMD &request, const std::string &command) {
     return request.cmd.substr(0, command.length()) == command;
 }
 
-void discover(server_state &state, server_options &options, const struct sockaddr_in &client_address, SIMPL_CMD &request) {
-    send_complex_message(state.socket, client_address, "GOOD_DAY", options.MCAST_ADDR, request.cmd_seq, state.available_space);
+void
+discover(server_state &state, server_options &options, const struct sockaddr_in &client_address, SIMPL_CMD &request) {
+    send_complex_message(state.socket, client_address, "GOOD_DAY", options.MCAST_ADDR, request.cmd_seq,
+                         state.available_space);
 }
 
 void remove(server_options &options, server_state &state, const std::string &target_file_name) {
@@ -188,37 +192,36 @@ void remove(server_options &options, server_state &state, const std::string &tar
 
 void list(server_options &options, server_state &state, const struct sockaddr_in &client_address, SIMPL_CMD &request) {
     std::string &target_file_name = request.data;
-    std::vector<std::string> results;
+    std::list<std::string> results;
     for (const fs::path &file : state.files) {
-        const std::string &file_name = file.filename().string();
+        std::string file_name = file.filename().string();
+//        std::cout << file_name << "\n";
         if (file_name.find(target_file_name) != std::string::npos) {
             results.push_back(file_name);
         }
     }
 
     std::string data;
-    if (!results.empty()) {
-        data = results[0];
-        for (const std::string &file_name : results) {
-            data += "\n" + file_name;
-        }
-    }
 
-    /* TODO many messages if list too big */
-    send_simple_message(state.socket, client_address, "MY_LIST", data, request.cmd_seq);
+    while (!results.empty()) {
+        if (!results.empty()) {
+            std::string current = results.front();
+            data = current;
+            results.pop_front();
+            while (!results.empty() && data.size() + current.size() + 1 < MAX_SIMPL_DATA_LEN) {
+                current = results.front();
+                results.pop_front();
+                data += "\n" + current;
+            }
+        }
+        std::cout << data.length();
+        send_simple_message(state.socket, client_address, "MY_LIST", data, request.cmd_seq);
+        data.clear();
+    }
 }
 
-void initialize_file_transfer(server_options &options, server_state &state, const struct sockaddr_in &client_udp, SIMPL_CMD &request) {
-    struct addrinfo addr_hints;
-    struct addrinfo *addr_result;
-    int sock, msg_sock;
-    struct sockaddr_in server_tcp;
-    struct sockaddr_in client_tcp;
-    socklen_t client_tcp_len = sizeof client_tcp;
-    socklen_t server_tcp_len = sizeof server_tcp;
-
-    ssize_t len, snd_len;
-
+void
+create_tcp_socket(int &sock, const struct sockaddr_in &client_udp, struct sockaddr_in &server_tcp, socklen_t &server_tcp_len) {
     /* IPv4 TCP socket */
     sock = socket(PF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
@@ -236,21 +239,32 @@ void initialize_file_transfer(server_options &options, server_state &state, cons
     if (listen(sock, QUEUE_LENGTH) < 0) {
         throw std::runtime_error("listen");
     }
-    if (getsockname(sock, (struct sockaddr *)&server_tcp, &server_tcp_len) < 0){
+    if (getsockname(sock, (struct sockaddr *) &server_tcp, &server_tcp_len) < 0) {
         throw std::runtime_error("getsockname");
     }
 
-    std::cout << "port: " << server_tcp.sin_port << "\n";
-
+    std::cout << "port: " << ntohs(server_tcp.sin_port) << "\n";
     std::cout << "accepting\n";
+}
 
+void upload_file(server_options &options, server_state &state, const struct sockaddr_in &client_udp,
+                 SIMPL_CMD &request, const fs::path &path) {
+    int sock, msg_sock;
+    struct sockaddr_in server_tcp{};
+    struct sockaddr_in client_tcp{};
+    socklen_t client_tcp_len = sizeof client_tcp;
+    socklen_t server_tcp_len = sizeof server_tcp;
+    ssize_t len, snd_len;
+
+    create_tcp_socket(sock, client_udp, server_tcp, server_tcp_len);
     struct timeval wait_time{options.TIMEOUT, 0};
     fd_set fds;
     FD_ZERO(&fds);
     FD_SET(sock, &fds);
     char buffer[BSIZE];
 
-    send_complex_message(state.socket, client_udp, "CONNECT_ME", request.data, request.cmd_seq, server_tcp.sin_port);
+    send_complex_message(state.socket, client_udp, "CONNECT_ME", request.data, request.cmd_seq,
+                         server_tcp.sin_port);
 
     if (select(sock + 1, &fds, nullptr, nullptr, &wait_time)) {
         client_tcp_len = sizeof(client_tcp);
@@ -258,9 +272,19 @@ void initialize_file_transfer(server_options &options, server_state &state, cons
         if (msg_sock < 0) {
             throw std::runtime_error("accept");
         }
-        snd_len = write(msg_sock, "ABC", 3);
-        if (snd_len != 3) {
-            throw std::runtime_error("writing to client socket");
+
+        int fd, readlen;
+        if ((fd = open(path.string().c_str(), O_RDONLY)) < 0) {
+            throw std::runtime_error("open");
+        }
+        while ((readlen = read(fd, buffer, BSIZE)) > 0) {
+            snd_len = write(msg_sock, buffer, readlen);
+            if (snd_len != readlen) {
+                throw std::runtime_error("writing to client socket");
+            }
+        }
+        if (readlen < 0) {
+            throw std::runtime_error("read");
         }
         printf("ending connection\n");
         if (close(msg_sock) < 0)
@@ -273,19 +297,25 @@ void initialize_file_transfer(server_options &options, server_state &state, cons
 
 
     close(state.socket);
-    close(msg_sock);
+    close(sock);
     std::cout << "child ending\n";
     exit(0);
 }
 
-void fetch(server_options &options, server_state &state, const struct sockaddr_in &client_address, SIMPL_CMD &request) {
-    for (auto &file : state.files) {
+void download_file(server_options &options, server_state &state, const struct sockaddr_in &client_udp,
+                   CMPLX_CMD &request) {
+    std::cout << "download\n";
+}
+
+void
+fetch(server_options &options, server_state &state, const struct sockaddr_in &client_address, SIMPL_CMD &request) {
+    for (const fs::path &file : state.files) {
         if (file.filename().string() == request.data) {
-            switch (fork())  {
+            switch (fork()) {
                 case -1:
                     throw std::runtime_error("fork");
                 case 0:
-                    initialize_file_transfer(options, state, client_address, request);
+                    upload_file(options, state, client_address, request, file);
                     break;
                 default:
                     std::cout << "parent\n";
@@ -293,6 +323,19 @@ void fetch(server_options &options, server_state &state, const struct sockaddr_i
             }
             return;
         }
+    }
+    std::cerr << "[PCKG ERROR] Skipping invalid package from " << inet_ntoa(client_address.sin_addr) << ":"
+              << client_address.sin_port << ". Invalid file name.\n";
+}
+
+void
+upload(server_options &options, server_state &state, const struct sockaddr_in &client_address, CMPLX_CMD &request) {
+    if (state.available_space < request.param ||
+        request.data.find('/') != std::string::npos) {
+        send_simple_message(state.socket, client_address, "NO_WAY", request.data, request.cmd_seq);
+    }
+    else {
+        download_file(options, state, client_address, request);
     }
 }
 
@@ -310,8 +353,11 @@ void read_requests(server_options &options, server_state &state) {
             throw std::runtime_error("read");
         }
         else {
-            if (rcv_len < MIN_CMD_LEN) {
+            if (rcv_len < MIN_SIMPL_LEN) {
                 /* TODO odnotować */
+                std::cerr << "[PCKG ERROR] Skipping invalid package from " << inet_ntoa(client_address.sin_addr)
+                          << ":"
+                          << client_address.sin_port << ". Message too short.\n";
                 continue;
             }
 
@@ -332,6 +378,10 @@ void read_requests(server_options &options, server_state &state) {
             }
             else if (command_equal(request, "GET")) {
                 fetch(options, state, client_address, request);
+            }
+            else if (command_equal(request, "ADD")) {
+                CMPLX_CMD complex_request(buffer, rcv_len);
+                upload(options, state, client_address, complex_request);
             }
             else {
                 /* TODO tak naprawdę to chyba drop packet */

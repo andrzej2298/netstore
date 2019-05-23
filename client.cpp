@@ -16,8 +16,11 @@
 #include <csignal>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <fcntl.h>
 
 #include "connection.h"
 
@@ -29,11 +32,20 @@ std::size_t TIMEOUT_MAX = 300;
 int TTL_VALUE = 4;
 int ENABLE_BROADCAST = 1;
 
+struct server_info;
+
+using server_infos = std::vector<server_info>;
+
 struct client_options {
     std::string MCAST_ADDR = "";
     int CMD_PORT = 0;
     std::string OUT_FLDR = "";
     unsigned int TIMEOUT = 0;
+};
+
+struct server_info {
+    uint64_t available_space = 0;
+    struct sockaddr_in socket{};
 };
 
 template<typename T>
@@ -46,6 +58,7 @@ struct client_state {
     int socket{};
     struct sockaddr_in remote_address{};
     std::vector<message<SIMPL_CMD>> previous_search;
+    server_infos previous_servers;
 };
 
 client_state current_client_state{};
@@ -194,10 +207,12 @@ void discover(client_state &state, client_options &options) {
     uint64_t cmd_seq = send_simple_client_message(state, "HELLO", "");
     std::vector<message<CMPLX_CMD>> server_messages;
     receive_timeouted_messages(state, options, server_messages);
+    state.previous_servers.clear();
 
     for (auto &info : server_messages) {
         std::cout << "Found " << inet_ntoa(info.address.sin_addr) << " (" << info.command.data << ") ";
         std::cout << "with free space " << info.command.param << "\n";
+        state.previous_servers.push_back({info.command.param, info.address});
     }
 }
 
@@ -227,8 +242,10 @@ void fetch(client_state &state, client_options &options, const std::string &argu
         auto t = tokenize(info);
         for (auto it = t.begin(); it != t.end(); ++it) {
             if (*it == argument) {
+                /* TODO wysyłanie na konkretny adres, a nie rozgłoszeniowy */
                 char buffer[BSIZE];
-                std::cout << *it << " " << inet_ntoa(info.address.sin_addr) << "\n";
+                std::string server_address_string(inet_ntoa(info.address.sin_addr));
+                std::cout << *it << " " << server_address_string << "\n";
                 send_simple_client_message(state, "GET", argument);
                 set_socket_receive_timeout(state.socket, {options.TIMEOUT, 0});
 
@@ -275,19 +292,33 @@ void fetch(client_state &state, client_options &options, const std::string &argu
                     throw std::runtime_error("connect");
 
 //                freeaddrinfo(addr_result);
-                memset(buffer, 0, BSIZE);
-                rcv_len = read(tcp_socket, buffer, sizeof(buffer) - 1);
+//                memset(buffer, 0, BSIZE);
+                rcv_len = 1;
+                std::string filename(options.OUT_FLDR + "/" + argument);
+                std::cout << "filename: " << filename << "\n";
+                int fd = open(filename.c_str(), O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+                while (rcv_len > 0) {
+                    rcv_len = read(tcp_socket, buffer, BSIZE);
+                    if (write(fd, buffer, rcv_len) < 0) {
+                        throw std::runtime_error("write");
+                    }
+                }
                 if (rcv_len < 0) {
                     throw std::runtime_error("read");
                 }
-                printf("read from socket: %zd bytes: %s\n", rcv_len, buffer);
+                std::cout << "File " <<  argument << " downloaded (" << server_address_string << ":" << server_address.sin_port << ")\n";
                 close(tcp_socket); // socket would be closed anyway when the program ends
                 return;
+                /* TODO czy zamieniać sin_port na sieciową kolejność bitów */
             }
         }
     }
 
     std::cout << "File " << argument << " wasn't found\n";
+}
+
+void upload(client_state &state, client_options &options, const std::string &argument) {
+
 }
 
 void remove(client_state &state, client_options &options, const std::string &argument) {
@@ -319,6 +350,9 @@ void handle_client_command(const std::smatch &match, client_state &state, client
         }
         else if (command == "fetch") {
             fetch(state, options, argument);
+        }
+        else if (command == "upload") {
+            upload(state, options, argument);
         }
         else {
             assert(false);

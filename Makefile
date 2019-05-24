@@ -1,5 +1,5 @@
 CXX=g++
-CPPFLAGS=-std=c++17 -Wall -Wextra -g -lboost_program_options -lboost_system -lboost_filesystem
+CPPFLAGS=-std=c++17 -Wall -Wextra -g -lboost_program_options -lboost_system -lboost_filesystem -lboost_regex
 
 all: netstore-client netstore-server
 

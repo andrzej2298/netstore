@@ -5,13 +5,15 @@
  * */
 
 #include <iostream>
-#include <regex>
 #include <algorithm>
 #include <chrono>
 #include <vector>
 
+#include <boost/config.hpp>
+#include <boost/filesystem.hpp>
 #include <boost/program_options.hpp>
 #include <boost/tokenizer.hpp>
+#include <boost/regex.hpp>
 
 #include <csignal>
 #include <netinet/in.h>
@@ -25,6 +27,7 @@
 #include "connection.h"
 
 namespace po = boost::program_options;
+namespace fs = boost::filesystem;
 namespace chr = std::chrono;
 
 std::size_t TIMEOUT_DEFAULT = 5;
@@ -45,7 +48,7 @@ struct client_options {
 
 struct server_info {
     uint64_t available_space = 0;
-    struct sockaddr_in socket{};
+    struct sockaddr_in address{};
 };
 
 template<typename T>
@@ -196,10 +199,7 @@ receive_timeouted_messages(client_state &state, client_options &options, std::ve
     /* revert socket timeout */
     wait_time.tv_sec = 0;
     wait_time.tv_usec = 0;
-    if (setsockopt(state.socket, SOL_SOCKET, SO_RCVTIMEO, (void *) &wait_time,
-                   sizeof wait_time) < 0) {
-        throw std::runtime_error("setsockopt");
-    }
+    set_socket_receive_timeout(state.socket, wait_time);
 }
 
 void discover(client_state &state, client_options &options) {
@@ -210,6 +210,9 @@ void discover(client_state &state, client_options &options) {
     state.previous_servers.clear();
 
     for (auto &info : server_messages) {
+        if (info.command.data.length() == 0) {
+
+        }
         std::cout << "Found " << inet_ntoa(info.address.sin_addr) << " (" << info.command.data << ") ";
         std::cout << "with free space " << info.command.param << "\n";
         state.previous_servers.push_back({info.command.param, info.address});
@@ -225,7 +228,7 @@ void search(client_state &state, client_options &options, const std::string &arg
         std::string address(inet_ntoa(info.address.sin_addr));
         auto t = tokenize(info);
         for (auto it = t.begin(); it != t.end(); ++it) {
-            std::cout << *it << " ("<< address << ")" << "\n";
+            std::cout << *it << " (" << address << ")" << "\n";
         }
     }
 
@@ -306,7 +309,8 @@ void fetch(client_state &state, client_options &options, const std::string &argu
                 if (rcv_len < 0) {
                     throw std::runtime_error("read");
                 }
-                std::cout << "File " <<  argument << " downloaded (" << server_address_string << ":" << server_address.sin_port << ")\n";
+                std::cout << "File " << argument << " downloaded (" << server_address_string << ":"
+                          << server_address.sin_port << ")\n";
                 close(tcp_socket); // socket would be closed anyway when the program ends
                 return;
                 /* TODO czy zamieniać sin_port na sieciową kolejność bitów */
@@ -318,17 +322,33 @@ void fetch(client_state &state, client_options &options, const std::string &argu
 }
 
 void upload(client_state &state, client_options &options, const std::string &argument) {
+    fs::path uploaded_file(argument);
+    std::cout << "filename: " << uploaded_file.filename().string() << "\n";
 
+    if (state.previous_servers.empty()) {
+        std::cout << "File " << argument << " uploading failed, no server available\n";
+        return;
+    }
+
+    std::sort(state.previous_servers.begin(), state.previous_servers.end(),
+              [](const server_info &lhs, const server_info &rhs) -> bool {
+                  return lhs.available_space > rhs.available_space;
+              });
+    const server_info &server = state.previous_servers[0];
+    std::cout << server.available_space << "\n";
+    send_complex_message(state.socket, server.address, "ADD", uploaded_file.filename().string(), get_cmd_seq(),
+                         file_size(uploaded_file));
 }
 
 void remove(client_state &state, client_options &options, const std::string &argument) {
     uint64_t cmd_seq = send_simple_client_message(state, "DEL", argument);
 }
 
-void handle_client_command(const std::smatch &match, client_state &state, client_options &options) {
+void handle_client_command(const boost::smatch &match, client_state &state, client_options &options) {
     std::string command, argument;
     if (match.size() == 1) {
         command = match[0];
+        std::transform(command.begin(), command.end(), command.begin(), ::tolower);
         if (command == "discover") {
             discover(state, options);
         }
@@ -342,6 +362,7 @@ void handle_client_command(const std::smatch &match, client_state &state, client
     else {
         command = match[1];
         argument = match[2];
+        std::transform(command.begin(), command.end(), command.begin(), ::tolower);
         if (command == "search") {
             search(state, options, argument);
         }
@@ -363,23 +384,27 @@ void handle_client_command(const std::smatch &match, client_state &state, client
 void client_loop(client_state &state, client_options &options) {
     /* TODO co ze spacjami przed i po oraz np. z danymi "search " oraz "search" */
     /* TODO czy na pewno te spacje, plusy i gwiazdki są dobrze obsłużone */
-    static const std::regex discover_r("discover");
-    static const std::regex search_r("(search) ?(.*)");
-    static const std::regex fetch_r("(fetch) (.+)");
-    static const std::regex upload_r("(upload) ?(.*)");
-    static const std::regex remove_r("(remove) (.+)");
-    static const std::regex exit_r("exit");
-    static const std::regex expressions[] = {discover_r, search_r, fetch_r,
-                                             upload_r, remove_r, exit_r};
+    static const boost::regex discover_r("discover",
+                                         boost::regex_constants::ECMAScript | boost::regex_constants::icase);
+    static const boost::regex search_r("(search) ?(.*)",
+                                       boost::regex_constants::ECMAScript | boost::regex_constants::icase);
+    static const boost::regex fetch_r("(fetch) (.+)",
+                                      boost::regex_constants::ECMAScript | boost::regex_constants::icase);
+    static const boost::regex upload_r("(upload) ?(.*)",
+                                       boost::regex_constants::ECMAScript | boost::regex_constants::icase);
+    static const boost::regex remove_r("(remove) (.+)",
+                                       boost::regex_constants::ECMAScript | boost::regex_constants::icase);
+    static const boost::regex exit_r("exit", boost::regex_constants::ECMAScript | boost::regex_constants::icase);
+    static const boost::regex expressions[] = {discover_r, search_r, fetch_r,
+                                               upload_r, remove_r, exit_r};
 
     for (;;) {
         std::string line;
         std::getline(std::cin, line);
-        std::transform(line.begin(), line.end(), line.begin(), ::tolower);
-        std::smatch match;
+        boost::smatch match;
 
-        for (const std::regex &r : expressions) {
-            if (std::regex_match(line, match, r)) {
+        for (const boost::regex &r : expressions) {
+            if (boost::regex_match(line, match, r)) {
                 handle_client_command(match, state, options);
                 break;
             }

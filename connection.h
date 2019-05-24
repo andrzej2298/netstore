@@ -7,6 +7,7 @@
 #define CMD_LEN 10
 #define BSIZE 65507
 #define MIN_SIMPL_LEN (CMD_LEN + sizeof(uint64_t))
+#define MIN_CMPLX_LEN (CMD_LEN + 2 * sizeof(uint64_t))
 #define MAX_SIMPL_DATA_LEN (BSIZE - MIN_SIMPL_LEN)
 
 void serialize_string(char *to, const std::string &from, std::size_t &i, std::size_t n);

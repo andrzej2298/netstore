@@ -2,8 +2,10 @@
 #include <list>
 #include <regex>
 #include <cassert>
+
 #include <boost/filesystem.hpp>
 #include <boost/program_options.hpp>
+
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -41,7 +43,6 @@ struct server_state {
     int socket = 0;
     struct ip_mreq ip_mreq{};
     file_infos files;
-    server_infos servers;
 };
 
 server_state current_server_state{};
@@ -221,7 +222,8 @@ void list(server_options &options, server_state &state, const struct sockaddr_in
 }
 
 void
-create_tcp_socket(int &sock, const struct sockaddr_in &client_udp, struct sockaddr_in &server_tcp, socklen_t &server_tcp_len) {
+create_tcp_socket(int &sock, const struct sockaddr_in &client_udp, struct sockaddr_in &server_tcp,
+                  socklen_t &server_tcp_len) {
     /* IPv4 TCP socket */
     sock = socket(PF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
@@ -302,11 +304,6 @@ void upload_file(server_options &options, server_state &state, const struct sock
     exit(0);
 }
 
-void download_file(server_options &options, server_state &state, const struct sockaddr_in &client_udp,
-                   CMPLX_CMD &request) {
-    std::cout << "download\n";
-}
-
 void
 fetch(server_options &options, server_state &state, const struct sockaddr_in &client_address, SIMPL_CMD &request) {
     for (const fs::path &file : state.files) {
@@ -318,7 +315,7 @@ fetch(server_options &options, server_state &state, const struct sockaddr_in &cl
                     upload_file(options, state, client_address, request, file);
                     break;
                 default:
-                    std::cout << "parent\n";
+                    std::cout << "parent fetch\n";
                     break;
             }
             return;
@@ -328,6 +325,12 @@ fetch(server_options &options, server_state &state, const struct sockaddr_in &cl
               << client_address.sin_port << ". Invalid file name.\n";
 }
 
+
+void download_file(server_options &options, server_state &state, const struct sockaddr_in &client_udp,
+                   CMPLX_CMD &request) {
+    std::cout << "download\n";
+}
+
 void
 upload(server_options &options, server_state &state, const struct sockaddr_in &client_address, CMPLX_CMD &request) {
     if (state.available_space < request.param ||
@@ -335,7 +338,16 @@ upload(server_options &options, server_state &state, const struct sockaddr_in &c
         send_simple_message(state.socket, client_address, "NO_WAY", request.data, request.cmd_seq);
     }
     else {
-        download_file(options, state, client_address, request);
+        switch (fork()) {
+            case -1:
+                throw std::runtime_error("fork");
+            case 0:
+                download_file(options, state, client_address, request);
+                break;
+            default:
+                std::cout << "parent upload\n";
+                break;
+        }
     }
 }
 

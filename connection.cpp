@@ -38,6 +38,10 @@ SIMPL_CMD::SIMPL_CMD(std::string _cmd, uint64_t _cmd_seq, std::string _data)
 }
 
 SIMPL_CMD::SIMPL_CMD(const char *input, ssize_t length) {
+    if (length < MIN_SIMPL_LEN) {
+        throw std::runtime_error("wrong message format");
+        /* TODO teraz trzeba to łapać */
+    }
     serialized = new char[length];
     memcpy(serialized, input, length);
     serialized_length = length;
@@ -94,6 +98,10 @@ CMPLX_CMD::CMPLX_CMD(std::string _cmd, uint64_t _cmd_seq, uint64_t _param, std::
 }
 
 CMPLX_CMD::CMPLX_CMD(const char *input, ssize_t length) {
+    if (length < MIN_CMPLX_LEN) {
+        throw std::runtime_error("wrong message format");
+        /* TODO teraz trzeba to łapać */
+    }
     serialized = new char[length];
     memcpy(serialized, input, length);
     serialized_length = length;
@@ -165,6 +173,27 @@ uint64_t send_complex_message(int socket, const struct sockaddr_in &address, con
         throw std::runtime_error("write");
     }
     return cmd_seq;
+}
+
+CMPLX_CMD receive_timeouted_complex_message(int socket, const struct sockaddr_in &address, struct timeval wait_time) {
+    struct sockaddr_in server_address{};
+    char buffer[BSIZE];
+    socklen_t addrlen = sizeof server_address;
+    ssize_t rcv_len;
+    set_socket_receive_timeout(socket, wait_time);
+
+    rcv_len = recvfrom(socket, buffer, BSIZE, 0, (struct sockaddr *) &server_address, &addrlen);
+    if (rcv_len < 0) {
+        if (rcv_len != -1 ||
+            (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINPROGRESS)) {
+            /* not caused by timeout */
+            throw std::runtime_error("read");
+        }
+    }
+
+    /* TODO */
+
+    return CMPLX_CMD(buffer, rcv_len);
 }
 
 

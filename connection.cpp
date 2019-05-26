@@ -38,7 +38,7 @@ SIMPL_CMD::SIMPL_CMD(std::string _cmd, uint64_t _cmd_seq, std::string _data)
 }
 
 SIMPL_CMD::SIMPL_CMD(const char *input, ssize_t length) {
-    if (length < MIN_SIMPL_LEN) {
+    if (length < (ssize_t) MIN_SIMPL_LEN) {
         throw std::runtime_error("wrong message format");
         /* TODO teraz trzeba to łapać */
     }
@@ -98,7 +98,7 @@ CMPLX_CMD::CMPLX_CMD(std::string _cmd, uint64_t _cmd_seq, uint64_t _param, std::
 }
 
 CMPLX_CMD::CMPLX_CMD(const char *input, ssize_t length) {
-    if (length < MIN_CMPLX_LEN) {
+    if (length < (ssize_t) MIN_CMPLX_LEN) {
         throw std::runtime_error("wrong message format");
         /* TODO teraz trzeba to łapać */
     }
@@ -156,7 +156,9 @@ void set_socket_option(int socket, int optval, int level, int optname, const std
     }
 }
 
-uint64_t send_simple_message(int socket, const struct sockaddr_in &address, const std::string &cmd, const std::string &data, uint64_t cmd_seq) {
+uint64_t
+send_simple_message(int socket, const struct sockaddr_in &address, const std::string &cmd, const std::string &data,
+                    uint64_t cmd_seq) {
     /* TODO z czy bez nawiasów */
     SIMPL_CMD command(cmd, cmd_seq, data);
     if (sendto(socket, command.serialized, command.serialized_length, 0,
@@ -166,35 +168,38 @@ uint64_t send_simple_message(int socket, const struct sockaddr_in &address, cons
     return cmd_seq;
 }
 
-uint64_t send_complex_message(int socket, const struct sockaddr_in &address, const std::string &cmd, const std::string &data, uint64_t cmd_seq, uint64_t param) {
+uint64_t
+send_complex_message(int socket, const struct sockaddr_in &address, const std::string &cmd, const std::string &data,
+                     uint64_t cmd_seq, uint64_t param) {
     CMPLX_CMD command(cmd, cmd_seq, param, data);
     if (sendto(socket, command.serialized, command.serialized_length, 0,
-                          (struct sockaddr *) &address, sizeof address) != command.serialized_length) {
+               (struct sockaddr *) &address, sizeof address) != command.serialized_length) {
         throw std::runtime_error("write");
     }
     return cmd_seq;
 }
 
-CMPLX_CMD receive_timeouted_complex_message(int socket, const struct sockaddr_in &address, struct timeval wait_time) {
-    struct sockaddr_in server_address{};
-    char buffer[BSIZE];
-    socklen_t addrlen = sizeof server_address;
-    ssize_t rcv_len;
-    set_socket_receive_timeout(socket, wait_time);
-
-    rcv_len = recvfrom(socket, buffer, BSIZE, 0, (struct sockaddr *) &server_address, &addrlen);
-    if (rcv_len < 0) {
-        if (rcv_len != -1 ||
-            (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINPROGRESS)) {
-            /* not caused by timeout */
-            throw std::runtime_error("read");
-        }
-    }
-
-    /* TODO */
-
-    return CMPLX_CMD(buffer, rcv_len);
-}
+//CMPLX_CMD receive_timeouted_complex_message(int socket, const struct sockaddr_in &address, struct timeval wait_time) {
+//    struct sockaddr_in server_address{};
+//    char buffer[BSIZE];
+//    socklen_t addrlen = sizeof server_address;
+//    ssize_t rcv_len;
+//    set_socket_receive_timeout(socket, wait_time);
+//
+//    rcv_len = recvfrom(socket, buffer, BSIZE, 0, (struct sockaddr *) &server_address, &addrlen);
+//    if (rcv_len < 0) {
+//        if (rcv_len != -1 ||
+//            (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINPROGRESS)) {
+//            /* not caused by timeout */
+//            throw std::runtime_error("read");
+//        }
+//        else {
+//            throw std::runtime_error("timeout");
+//        }
+//    }
+//
+//    return CMPLX_CMD(buffer, rcv_len);
+//}
 
 
 void set_socket_receive_timeout(int socket, struct timeval wait_time) {

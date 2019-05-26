@@ -1,7 +1,8 @@
 /* TODO
- * - sprawdzanie cmd_seq
+ * - obsługiwanie cmd_seq
+ * - obsługiwanie timeoutów
  * - dzielenie listy plików
- * - sprawdzanie, czy pakiet ma poprawne polecenie
+ * - sprawdzanie, czy pakiet ma poprawne polecenie (CONNECT_ME itp.)
  * */
 
 #include <iostream>
@@ -111,30 +112,7 @@ boost::tokenizer<boost::char_separator<char>> tokenize(const message<SIMPL_CMD> 
     return t;
 }
 
-void initialize_connection(const client_options &options, client_state &state) {
-    /* socket info */
-    struct sockaddr_in local_address{};
-
-    /* opening the socket */
-    state.socket = socket(AF_INET, SOCK_DGRAM, 0);
-    if (state.socket < 0) {
-        throw std::runtime_error("socket");
-    }
-
-    /* host address */
-    local_address.sin_family = AF_INET;
-    local_address.sin_addr.s_addr = htonl(INADDR_ANY);
-    local_address.sin_port = htons(0);
-    if (bind(state.socket, (struct sockaddr *) &local_address, sizeof local_address) < 0) {
-        throw std::runtime_error("bind");
-    }
-
-    /* enabling broadcast */
-    set_socket_option(state.socket, ENABLE_BROADCAST, SOL_SOCKET, SO_BROADCAST, "setsockopt broadcast");
-
-    /* setting TTL */
-    set_socket_option(state.socket, TTL_VALUE, IPPROTO_IP, IP_MULTICAST_TTL, "setsockopt multicast ttl");
-
+void add_remote_address(const client_options &options, client_state &state) {
     /* multicast address */
     state.remote_address.sin_family = AF_INET;
     state.remote_address.sin_port = htons(options.CMD_PORT);
@@ -143,12 +121,42 @@ void initialize_connection(const client_options &options, client_state &state) {
     }
 }
 
-uint64_t send_simple_client_message(client_state &state, const std::string &cmd, const std::string &data) {
-    return send_simple_message(state.socket, state.remote_address, cmd, data, get_cmd_seq());
+void initialize_socket(int &sock) {
+    /* socket info */
+    struct sockaddr_in local_address{};
+
+    /* opening the socket */
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        throw std::runtime_error("socket");
+    }
+
+    /* host address */
+    local_address.sin_family = AF_INET;
+    local_address.sin_addr.s_addr = htonl(INADDR_ANY);
+    local_address.sin_port = htons(0);
+    if (bind(sock, (struct sockaddr *) &local_address, sizeof local_address) < 0) {
+        throw std::runtime_error("bind");
+    }
+
+    /* enabling broadcast */
+    set_socket_option(sock, ENABLE_BROADCAST, SOL_SOCKET, SO_BROADCAST, "setsockopt broadcast");
+
+    /* setting TTL */
+    set_socket_option(sock, TTL_VALUE, IPPROTO_IP, IP_MULTICAST_TTL, "setsockopt multicast ttl");
+}
+
+void initialize_connection(const client_options &options, client_state &state) {
+    initialize_socket(state.socket);
+    add_remote_address(options, state);
+}
+
+uint64_t send_simple_client_message(int socket, client_state &state, const std::string &cmd, const std::string &data) {
+    return send_simple_message(socket, state.remote_address, cmd, data, get_cmd_seq());
 }
 
 template<typename T>
-void receive_timeouted_message(client_state &state, const chr::system_clock::time_point &end_point,
+void receive_timeouted_message(int socket, const chr::system_clock::time_point &end_point,
                                const chr::system_clock::time_point &current_time, struct timeval &wait_time,
                                char *buffer,
                                std::vector<message<T>> &server_messages) {
@@ -159,9 +167,9 @@ void receive_timeouted_message(client_state &state, const chr::system_clock::tim
     chr::seconds sec = chr::duration_cast<chr::seconds>(remaining_time);
     wait_time.tv_sec = sec.count();
     wait_time.tv_usec = chr::duration_cast<chr::microseconds>(remaining_time - sec).count();
-    set_socket_receive_timeout(state.socket, wait_time);
+    set_socket_receive_timeout(socket, wait_time);
 
-    rcv_len = recvfrom(state.socket, buffer, BSIZE, 0, (struct sockaddr *) &server_address, &addrlen);
+    rcv_len = recvfrom(socket, buffer, BSIZE, 0, (struct sockaddr *) &server_address, &addrlen);
     if (rcv_len < 0) {
         if (rcv_len != -1 ||
             (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINPROGRESS)) {
@@ -177,10 +185,10 @@ void receive_timeouted_message(client_state &state, const chr::system_clock::tim
 
 template<typename T>
 void
-receive_timeouted_messages(client_state &state, client_options &options, std::vector<message<T>> &server_messages) {
+receive_timeouted_messages(int socket, client_options &options, std::vector<message<T>> &server_messages,
+                           std::size_t limit) {
     /* TODO sprawdzić czy wiadomość jest poprawna (np. długość), bo będą błędy przy deserializacji */
     char buffer[BSIZE];
-
 
     chr::system_clock::time_point start_point = chr::system_clock::now();
     std::chrono::seconds timeout(options.TIMEOUT);
@@ -188,47 +196,57 @@ receive_timeouted_messages(client_state &state, client_options &options, std::ve
     struct timeval wait_time{};
     for (;;) {
         chr::system_clock::time_point current_time = chr::system_clock::now();
-        if (end_point < current_time) {
+        if (end_point < current_time || server_messages.size() >= limit) {
             break;
         }
         else {
-            receive_timeouted_message(state, end_point, current_time, wait_time, buffer, server_messages);
+            receive_timeouted_message(socket, end_point, current_time, wait_time, buffer, server_messages);
         }
     }
 
     /* revert socket timeout */
     wait_time.tv_sec = 0;
     wait_time.tv_usec = 0;
-    set_socket_receive_timeout(state.socket, wait_time);
+    set_socket_receive_timeout(socket, wait_time);
 }
 
-void discover(client_state &state, client_options &options) {
-    /* TODO sprawdzanie seq */
-    uint64_t cmd_seq = send_simple_client_message(state, "HELLO", "");
+void hello(int socket, client_state &state, client_options &options, bool print) {
+    uint64_t cmd_seq = send_simple_client_message(socket, state, "HELLO", "");
     std::vector<message<CMPLX_CMD>> server_messages;
-    receive_timeouted_messages(state, options, server_messages);
+    receive_timeouted_messages(socket, options, server_messages, SIZE_MAX);
     state.previous_servers.clear();
 
     for (auto &info : server_messages) {
-        if (info.command.data.length() == 0) {
-
+        if (check_data_not_empty(info.command, info.address) &&
+            check_cmd(info.command, "GOOD_DAY", info.address) &&
+            check_cmd_seq(info.command, cmd_seq, info.address)) {
+            state.previous_servers.push_back({info.command.param, info.address});
+            if (print) {
+                std::cout << "Found " << inet_ntoa(info.address.sin_addr) << " (" << info.command.data << ") ";
+                std::cout << "with free space " << info.command.param << "\n";
+            }
         }
-        std::cout << "Found " << inet_ntoa(info.address.sin_addr) << " (" << info.command.data << ") ";
-        std::cout << "with free space " << info.command.param << "\n";
-        state.previous_servers.push_back({info.command.param, info.address});
     }
 }
 
+void discover(client_state &state, client_options &options) {
+    hello(state.socket, state, options, true);
+}
+
 void search(client_state &state, client_options &options, const std::string &argument) {
-    uint64_t cmd_seq = send_simple_client_message(state, "LIST", argument);
+    uint64_t cmd_seq = send_simple_client_message(state.socket, state, "LIST", argument);
     std::vector<message<SIMPL_CMD>> server_messages;
-    receive_timeouted_messages(state, options, server_messages);
+    receive_timeouted_messages(state.socket, options, server_messages, SIZE_MAX);
 
     for (auto &info : server_messages) {
-        std::string address(inet_ntoa(info.address.sin_addr));
-        auto t = tokenize(info);
-        for (auto it = t.begin(); it != t.end(); ++it) {
-            std::cout << *it << " (" << address << ")" << "\n";
+        if (check_data_not_empty(info.command, info.address) &&
+            check_cmd(info.command, "MY_LIST", info.address) &&
+            check_cmd_seq(info.command, cmd_seq, info.address)) {
+            std::string address(inet_ntoa(info.address.sin_addr));
+            auto t = tokenize(info);
+            for (auto it = t.begin(); it != t.end(); ++it) {
+                std::cout << *it << " (" << address << ")" << "\n";
+            }
         }
     }
 
@@ -240,80 +258,79 @@ void search(client_state &state, client_options &options, const std::string &arg
     }
 }
 
+void receive_file(client_options &options, const message<SIMPL_CMD> &info,
+                  const std::string &argument) {
+    int sock;
+    initialize_socket(sock);
+    /* TODO wysyłanie na konkretny adres, a nie rozgłoszeniowy */
+    char buffer[BSIZE];
+    uint64_t cmd_seq = send_simple_message(sock, info.address, "GET", argument, get_cmd_seq());
+//                send_simple_client_message(state, "GET", argument);
+    set_socket_receive_timeout(sock, {options.TIMEOUT, 0});
+
+    ssize_t rcv_len;
+    socklen_t addrlen = sizeof info.address;
+    rcv_len = recvfrom(sock, buffer, BSIZE, 0, (struct sockaddr *) &info.address, &addrlen);
+    if (rcv_len < 0) {
+        if (rcv_len != -1 ||
+            (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINPROGRESS)) {
+            /* not caused by timeout */
+            throw std::runtime_error("read");
+        }
+    }
+    CMPLX_CMD message(buffer, rcv_len);
+    std::cout << "port: " << message.param << "\n";
+
+    int tcp_socket;
+    struct sockaddr_in server_address{info.address};
+    server_address.sin_port = message.param;
+    std::string server_address_string(inet_ntoa(info.address.sin_addr));
+
+    tcp_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (tcp_socket < 0)
+        throw std::runtime_error("socket");
+
+    if (connect(tcp_socket, (struct sockaddr *) &server_address, sizeof server_address) < 0)
+        throw std::runtime_error("connect");
+
+    rcv_len = 1;
+    std::string filename(options.OUT_FLDR + "/" + argument);
+    std::cout << "filename: " << filename << "\n";
+    int fd = open(filename.c_str(), O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    while (rcv_len > 0) {
+        rcv_len = read(tcp_socket, buffer, BSIZE);
+        if (write(fd, buffer, rcv_len) < 0) {
+            throw std::runtime_error("write");
+        }
+    }
+    if (rcv_len < 0) {
+        throw std::runtime_error("read");
+    }
+    std::cout << "File " << argument << " downloaded (" << server_address_string << ":"
+              << server_address.sin_port << ")\n";
+    close(tcp_socket);
+    std::cout << "child ending\n";
+    exit(0);
+}
+
 void fetch(client_state &state, client_options &options, const std::string &argument) {
     for (auto &info : state.previous_search) {
         auto t = tokenize(info);
         for (auto it = t.begin(); it != t.end(); ++it) {
             if (*it == argument) {
-                /* TODO wysyłanie na konkretny adres, a nie rozgłoszeniowy */
-                char buffer[BSIZE];
-                std::string server_address_string(inet_ntoa(info.address.sin_addr));
-                std::cout << *it << " " << server_address_string << "\n";
-                send_simple_client_message(state, "GET", argument);
-                set_socket_receive_timeout(state.socket, {options.TIMEOUT, 0});
-
-                ssize_t rcv_len;
-                socklen_t addrlen = sizeof info.address;
-                rcv_len = recvfrom(state.socket, buffer, BSIZE, 0, (struct sockaddr *) &info.address, &addrlen);
-                if (rcv_len < 0) {
-                    if (rcv_len != -1 ||
-                        (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINPROGRESS)) {
-                        /* not caused by timeout */
-                        throw std::runtime_error("read");
-                    }
+                switch (fork()) {
+                    case -1:
+                        throw std::runtime_error("fork");
+                    case 0:
+                        std::cout << "child fetch\n";
+                        receive_file(options, info, argument);
+                        return;
+                    default:
+                        std::cout << "parent fetch\n";
+                        break;
                 }
-                CMPLX_CMD message(buffer, rcv_len);
-                std::cout << "port: " << message.param << "\n";
-
-                int tcp_socket;
-//                struct addrinfo addr_hints;
-                struct addrinfo *addr_result;
-                struct sockaddr_in server_address{info.address};
-                server_address.sin_port = message.param;
-
-                // 'converting' host/port in string to struct addrinfo
-//                memset(&addr_hints, 0, sizeof(struct addrinfo));
-//                addr_hints.ai_family = AF_INET; // IPv4
-//                addr_hints.ai_socktype = SOCK_STREAM;
-//                addr_hints.ai_protocol = IPPROTO_TCP;
-
-//                if (getaddrinfo(inet_ntoa(info.address.sin_addr), std::to_string(message.param).c_str(),
-//                       &addr_hints, &addr_result) != 0) {
-//                    throw std::runtime_error("getaddrinfo");
-//                }
-
-                // initialize socket according to getaddrinfo results
-//                tcp_socket = socket(addr_result->ai_family, addr_result->ai_socktype, addr_result->ai_protocol);
-//                if (tcp_socket < 0)
-//                    throw std::runtime_error("socket");
-                tcp_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-                if (tcp_socket < 0)
-                    throw std::runtime_error("socket");
-
-                // connect socket to the server
-                if (connect(tcp_socket, (struct sockaddr *) &server_address, sizeof server_address) < 0)
-                    throw std::runtime_error("connect");
-
-//                freeaddrinfo(addr_result);
-//                memset(buffer, 0, BSIZE);
-                rcv_len = 1;
-                std::string filename(options.OUT_FLDR + "/" + argument);
-                std::cout << "filename: " << filename << "\n";
-                int fd = open(filename.c_str(), O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-                while (rcv_len > 0) {
-                    rcv_len = read(tcp_socket, buffer, BSIZE);
-                    if (write(fd, buffer, rcv_len) < 0) {
-                        throw std::runtime_error("write");
-                    }
-                }
-                if (rcv_len < 0) {
-                    throw std::runtime_error("read");
-                }
-                std::cout << "File " << argument << " downloaded (" << server_address_string << ":"
-                          << server_address.sin_port << ")\n";
-                close(tcp_socket); // socket would be closed anyway when the program ends
-                return;
                 /* TODO czy zamieniać sin_port na sieciową kolejność bitów */
+                return;
             }
         }
     }
@@ -321,27 +338,91 @@ void fetch(client_state &state, client_options &options, const std::string &argu
     std::cout << "File " << argument << " wasn't found\n";
 }
 
-void upload(client_state &state, client_options &options, const std::string &argument) {
-    fs::path uploaded_file(argument);
-    std::cout << "filename: " << uploaded_file.filename().string() << "\n";
-
+void send_file(client_options &options, client_state &state, const std::string &argument, fs::path &uploaded_file) {
+    int sock;
+    initialize_socket(sock);
+    hello(sock, state, options, false);
     if (state.previous_servers.empty()) {
         std::cout << "File " << argument << " uploading failed, no server available\n";
         return;
     }
+    std::cout << "sendfile\n";
 
     std::sort(state.previous_servers.begin(), state.previous_servers.end(),
               [](const server_info &lhs, const server_info &rhs) -> bool {
                   return lhs.available_space > rhs.available_space;
               });
-    const server_info &server = state.previous_servers[0];
-    std::cout << server.available_space << "\n";
-    send_complex_message(state.socket, server.address, "ADD", uploaded_file.filename().string(), get_cmd_seq(),
-                         file_size(uploaded_file));
+
+
+    for (const auto &server : state.previous_servers) {
+        send_complex_message(sock, server.address, "ADD", uploaded_file.filename().string(), get_cmd_seq(),
+                             file_size(uploaded_file));
+        std::vector<message<CMPLX_CMD>> messages;
+        receive_timeouted_messages(sock, options, messages, 1); /* receive at most one message */
+        std::string can_add("CAN_ADD");
+
+        if (!messages.empty() && messages[0].command.cmd.substr(0, can_add.length()) == can_add) {
+            std::cout << messages[0].command.cmd << "\n";
+            message<CMPLX_CMD> &message(messages[0]);
+            int tcp_socket;
+            struct sockaddr_in server_address{server.address};
+            server_address.sin_port = message.command.param;
+            char buffer[BSIZE];
+            ssize_t read_len;
+            std::string server_address_string(inet_ntoa(message.address.sin_addr));
+
+            tcp_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (tcp_socket < 0)
+                throw std::runtime_error("socket");
+
+            if (connect(tcp_socket, (struct sockaddr *) &server_address, sizeof server_address) < 0)
+                throw std::runtime_error("connect");
+
+            read_len = 1;
+            const std::string &filename = uploaded_file.string();
+            std::cout << "filename: " << filename << "\n";
+            int fd = open(filename.c_str(), O_RDONLY);
+            while (read_len > 0) {
+                read_len = read(fd, buffer, BSIZE);
+                if (write(tcp_socket, buffer, read_len) < 0) {
+                    throw std::runtime_error("write");
+                }
+            }
+            if (read_len < 0) {
+                throw std::runtime_error("read");
+            }
+            std::cout << "File " << filename << " uploaded (" << server_address_string << ":"
+                      << server_address.sin_port << ")\n";
+            return;
+        }
+    }
+    std::cout << "child ending\n";
+    exit(0);
 }
 
-void remove(client_state &state, client_options &options, const std::string &argument) {
-    uint64_t cmd_seq = send_simple_client_message(state, "DEL", argument);
+void upload(client_state &state, client_options &options, const std::string &argument) {
+    fs::path uploaded_file(argument);
+    if (!fs::exists(uploaded_file)) {
+        std::cout << "File " << argument << " does not exist\n";
+        return;
+    }
+
+    switch (fork()) {
+        case -1:
+            throw std::runtime_error("fork");
+        case 0:
+            std::cout << "child upload\n";
+            send_file(options, state, argument, uploaded_file);
+            return;
+        default:
+            std::cout << "parent upload\n";
+            break;
+    }
+//    std::cout << "File " << argument << " uploading failed (" << {ip_serwera} << ":" << {port_serwera} << ") " << {opis_błędu} << "\n";
+}
+
+void remove(client_state &state, const std::string &argument) {
+    uint64_t cmd_seq = send_simple_client_message(state.socket, state, "DEL", argument);
 }
 
 void handle_client_command(const boost::smatch &match, client_state &state, client_options &options) {
@@ -367,7 +448,7 @@ void handle_client_command(const boost::smatch &match, client_state &state, clie
             search(state, options, argument);
         }
         else if (command == "remove") {
-            remove(state, options, argument);
+            remove(state, argument);
         }
         else if (command == "fetch") {
             fetch(state, options, argument);
@@ -412,29 +493,38 @@ void client_loop(client_state &state, client_options &options) {
     }
 }
 
-void catch_signal(int) {
+void catch_sigint(int) {
     clean_up(current_client_state);
 }
 
 void add_signal_handlers() {
     struct sigaction signal_handler{};
-    signal_handler.sa_handler = catch_signal;
+    signal_handler.sa_handler = catch_sigint;
     sigemptyset(&signal_handler.sa_mask);
     signal_handler.sa_flags = 0;
 
     sigaction(SIGINT, &signal_handler, nullptr);
+
+    struct sigaction sigchld_handler{};
+    sigchld_handler.sa_handler = SIG_IGN;
+    sigemptyset(&sigchld_handler.sa_mask);
+    sigchld_handler.sa_flags = 0;
+
+    if (sigaction(SIGCHLD, &sigchld_handler, nullptr)) {
+        throw std::runtime_error("sigaction");
+    }
 }
 
 int main(int argc, char const *argv[]) {
-    try {
-        add_signal_handlers();
-        client_options options = read_options(argc, argv);
-        initialize_connection(options, current_client_state);
-        client_loop(current_client_state, options);
-        clean_up(current_client_state);
-    }
-    catch (const std::exception &exception) {
-        std::cerr << "error " << exception.what() << "\n";
-    }
+//    try {
+    add_signal_handlers();
+    client_options options = read_options(argc, argv);
+    initialize_connection(options, current_client_state);
+    client_loop(current_client_state, options);
+    clean_up(current_client_state);
+//    }
+//    catch (const std::exception &exception) {
+//        std::cerr << "error " << exception.what() << "\n";
+//    }
 }
 

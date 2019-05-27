@@ -175,6 +175,11 @@ void initialize_connection(const server_options &options, server_state &state) {
 }
 
 bool command_equal(const SIMPL_CMD &request, const std::string &command) {
+    for (std::size_t i = command.length(); i < request.cmd.length(); ++i) {
+        if (request.cmd[i] != '\0') {
+            return false;
+        }
+    }
     return request.cmd.substr(0, command.length()) == command;
 }
 
@@ -280,17 +285,17 @@ void send_file(server_options &options, server_state &state, const struct sockad
             throw std::runtime_error("accept");
         }
 
-        int fd, readlen;
+        int fd, read_len;
         if ((fd = open(path.string().c_str(), O_RDONLY)) < 0) {
             throw std::runtime_error("open");
         }
-        while ((readlen = read(fd, buffer, BSIZE)) > 0) {
-            snd_len = write(msg_sock, buffer, readlen);
-            if (snd_len != readlen) {
+        while ((read_len = read(fd, buffer, BSIZE)) > 0) {
+            snd_len = write(msg_sock, buffer, read_len);
+            if (snd_len != read_len) {
                 throw std::runtime_error("writing to client socket");
             }
         }
-        if (readlen < 0) {
+        if (read_len < 0) {
             throw std::runtime_error("read");
         }
         printf("ending connection\n");
@@ -320,14 +325,12 @@ fetch(server_options &options, server_state &state, const struct sockaddr_in &cl
                     send_file(options, state, client_address, request, file);
                     break;
                 default:
-                    std::cout << "parent fetch\n";
                     break;
             }
             return;
         }
     }
-    std::cerr << "[PCKG ERROR] Skipping invalid package from " << inet_ntoa(client_address.sin_addr) << ":"
-              << client_address.sin_port << ". Invalid file name.\n";
+    error_message(client_address, "Invalid file name.");
 }
 
 
@@ -392,7 +395,6 @@ void receive_file(server_options &options, server_state &state, const struct soc
 
     std::cout << "after accepting\n";
 
-
     close(state.socket);
     close(sock);
     std::cout << "child ending\n";
@@ -413,7 +415,10 @@ upload(server_options &options, server_state &state, const struct sockaddr_in &c
         send_simple_message(state.socket, client_address, "NO_WAY", request.data, request.cmd_seq);
     }
     else {
+        std::cout << "available_space: " << state.available_space << "\n";
         state.available_space -= request.param;
+        std::cout << "file_size: " << request.param << "\n";
+        std::cout << "available_space2: " << state.available_space << "\n";
         std::cout << "parent upload\n";
         fs::path new_file(options.SHRD_FLDR + "/" + request.data);
         std::cout << new_file << "\n";
@@ -436,7 +441,8 @@ void read_requests(server_options &options, server_state &state) {
     ssize_t rcv_len;
     struct sockaddr_in client_address{};
     socklen_t addrlen = sizeof client_address;
-    ssize_t min_len = MIN_SIMPL_LEN;
+    ssize_t min_simpl_len = MIN_SIMPL_LEN;
+    ssize_t min_cmplx_len = MIN_CMPLX_LEN;
 
     for (;;) {
         /* read */
@@ -445,11 +451,8 @@ void read_requests(server_options &options, server_state &state) {
             throw std::runtime_error("read");
         }
         else {
-            if (rcv_len < min_len) {
-                /* TODO odnotować */
-                std::cerr << "[PCKG ERROR] Skipping invalid package from " << inet_ntoa(client_address.sin_addr)
-                          << ":"
-                          << client_address.sin_port << ". Message too short.\n";
+            if (rcv_len < min_simpl_len) {
+                error_message(client_address, "Message too short.");
                 continue;
             }
 
@@ -457,7 +460,6 @@ void read_requests(server_options &options, server_state &state) {
             std::cout << request.cmd << " " << request.cmd_seq << "\n";
             std::cout << "port: " << htons(client_address.sin_port) << "\n";
             std::cout << "addr: " << inet_ntoa(client_address.sin_addr) << "\n";
-//            std::string cmd(buffer);
 
             if (command_equal(request, "HELLO")) {
                 discover(state, options, client_address, request);
@@ -472,17 +474,19 @@ void read_requests(server_options &options, server_state &state) {
                 fetch(options, state, client_address, request);
             }
             else if (command_equal(request, "ADD")) {
+                if (rcv_len < min_cmplx_len) {
+                    error_message(client_address, "Message too short.");
+                    continue;
+                }
                 CMPLX_CMD complex_request(buffer, rcv_len);
                 upload(options, state, client_address, complex_request);
             }
             else {
-                /* TODO tak naprawdę to chyba drop packet */
-                assert(false);
+                error_message(client_address, "Invalid cmd.");
             }
         }
     }
 }
-
 
 int main(int argc, char const *argv[]) {
     try {

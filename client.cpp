@@ -262,10 +262,8 @@ void receive_file(client_options &options, const message<SIMPL_CMD> &info,
                   const std::string &argument) {
     int sock;
     initialize_socket(sock);
-    /* TODO wysyłanie na konkretny adres, a nie rozgłoszeniowy */
     char buffer[BSIZE];
     uint64_t cmd_seq = send_simple_message(sock, info.address, "GET", argument, get_cmd_seq());
-//                send_simple_client_message(state, "GET", argument);
     set_socket_receive_timeout(sock, {options.TIMEOUT, 0});
 
     ssize_t rcv_len;
@@ -422,7 +420,7 @@ void upload(client_state &state, client_options &options, const std::string &arg
 }
 
 void remove(client_state &state, const std::string &argument) {
-    uint64_t cmd_seq = send_simple_client_message(state.socket, state, "DEL", argument);
+    send_simple_client_message(state.socket, state, "DEL", argument);
 }
 
 void handle_client_command(const boost::smatch &match, client_state &state, client_options &options) {

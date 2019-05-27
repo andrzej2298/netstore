@@ -61,8 +61,8 @@ struct CMPLX_CMD {
 void set_socket_option(int socket, int optval, int level, int optname, const std::string &error_message);
 uint64_t send_simple_message(int socket, const struct sockaddr_in &address, const std::string &cmd, const std::string &data, uint64_t cmd_seq);
 uint64_t send_complex_message(int socket, const struct sockaddr_in &address, const std::string &cmd, const std::string &data, uint64_t cmd_seq, uint64_t param);
-CMPLX_CMD receive_timeouted_complex_message(int socket, const struct sockaddr_in &address, struct timeval wait_time);
 void set_socket_receive_timeout(int socket, struct timeval wait_time);
+void error_message(struct sockaddr_in address, const std::string &message);
 
 /* template functions, necessary to be defined in the header file */
 template <typename T>
@@ -77,11 +77,11 @@ bool check_cmd_seq(T command, uint64_t cmd_seq, struct sockaddr_in address) {
 
 template <typename T>
 bool check_data_not_empty(T command, struct sockaddr_in address) {
-    if (command.data.length() != 0) {
+    if (command.data.length() == 0) {
         std::cerr << "[PCKG ERROR]  Skipping invalid package from " << inet_ntoa(address.sin_addr) << ":"
                   << address.sin_port << ". No data.\n";
     }
-    return command.data.length() == 0;
+    return command.data.length() != 0;
 }
 
 template <typename T>

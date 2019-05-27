@@ -179,32 +179,15 @@ send_complex_message(int socket, const struct sockaddr_in &address, const std::s
     return cmd_seq;
 }
 
-//CMPLX_CMD receive_timeouted_complex_message(int socket, const struct sockaddr_in &address, struct timeval wait_time) {
-//    struct sockaddr_in server_address{};
-//    char buffer[BSIZE];
-//    socklen_t addrlen = sizeof server_address;
-//    ssize_t rcv_len;
-//    set_socket_receive_timeout(socket, wait_time);
-//
-//    rcv_len = recvfrom(socket, buffer, BSIZE, 0, (struct sockaddr *) &server_address, &addrlen);
-//    if (rcv_len < 0) {
-//        if (rcv_len != -1 ||
-//            (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINPROGRESS)) {
-//            /* not caused by timeout */
-//            throw std::runtime_error("read");
-//        }
-//        else {
-//            throw std::runtime_error("timeout");
-//        }
-//    }
-//
-//    return CMPLX_CMD(buffer, rcv_len);
-//}
-
-
 void set_socket_receive_timeout(int socket, struct timeval wait_time) {
     if (setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, (void *) &wait_time,
                    sizeof wait_time) < 0) {
         throw std::runtime_error("setsockopt");
     }
+}
+
+void error_message(struct sockaddr_in address, const std::string &message) {
+    std::cerr << "[PCKG ERROR] Skipping invalid package from " << inet_ntoa(address.sin_addr)
+              << ":"
+              << address.sin_port << ". " << message << "\n";
 }

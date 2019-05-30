@@ -27,7 +27,6 @@ std::size_t TIMEOUT_MAX = 300;
 
 struct server_options;
 struct server_state;
-struct file_info;
 
 using file_infos = std::vector<fs::path>;
 
@@ -41,9 +40,11 @@ struct server_options {
 
 struct server_state {
     uint64_t available_space = 0;
+    uint64_t negative_space = 0;
     int socket = 0;
     struct ip_mreq ip_mreq{};
     file_infos files;
+    std::set<std::string> open_files;
 };
 
 server_state current_server_state{};
@@ -60,16 +61,14 @@ void clean_up(server_state &state) {
         }
     }
     close(state.socket);
+    for (const std::string &filename : state.open_files) {
+        unlink(filename.c_str());
+    }
 }
 
 void catch_sigint(int) {
-//    std::cout << "signal caught: " << getpid() << "\n";
     clean_up(current_server_state);
-    exit(0);
-}
-
-void catch_sigusr(int, siginfo_t *info, void *) {
-    std::cout << "caught sigusr from " << info->si_pid << "\n";
+    exit(-1);
 }
 
 void add_signal_handlers() {
@@ -117,6 +116,9 @@ server_options read_options(int argc, char const *argv[]) {
     if (options.TIMEOUT > TIMEOUT_MAX || options.TIMEOUT == 0) {
         throw std::invalid_argument("timeout");
     }
+    if (options.CMD_PORT < 0) {
+        throw std::invalid_argument("port");
+    }
 
     return options;
 }
@@ -133,8 +135,14 @@ void index_files(const server_options &options, server_state &state) {
                 fs::path file_path = it->path();
                 std::size_t current_file_size = file_size(file_path);
                 state.files.push_back(file_path);
-                assert(state.available_space > current_file_size);
-                state.available_space -= current_file_size;
+                if (state.available_space < current_file_size) {
+                    current_file_size -= state.available_space;
+                    state.available_space = 0;
+                    state.negative_space += current_file_size;
+                }
+                else {
+                    state.available_space -= current_file_size;
+                }
             }
         }
     }
@@ -185,19 +193,36 @@ bool command_equal(const SIMPL_CMD &request, const std::string &command) {
 
 void
 discover(server_state &state, server_options &options, const struct sockaddr_in &client_address, SIMPL_CMD &request) {
-    send_complex_message(state.socket, client_address, "GOOD_DAY", options.MCAST_ADDR, request.cmd_seq,
-                         state.available_space);
+    if (check_data_empty(request, client_address)) {
+        send_complex_message(state.socket, client_address, "GOOD_DAY", options.MCAST_ADDR, request.cmd_seq,
+                             state.available_space);
+    }
 }
 
-void remove(server_state &state, const std::string &target_file_name) {
-    auto it = state.files.begin();
+void remove(server_state &state, const struct sockaddr_in &client_address, SIMPL_CMD &request) {
+    if (check_data_not_empty(request, client_address)) {
+        const std::string &target_file_name = request.data;
+        auto it = state.files.begin();
 
-    for (; (it != state.files.end()) && (it->filename().string() != target_file_name); ++it) {}
-    if (it != state.files.end()) {
-        std::cout << it->filename().string() << "\n";
-        state.available_space += file_size(*it);
-        fs::remove(*it);
-        state.files.erase(it);
+        for (; (it != state.files.end()) && (it->filename().string() != target_file_name); ++it) {}
+        if (it != state.files.end()) {
+            std::size_t size = file_size(*it);
+            if (state.negative_space > 0) {
+                if (state.negative_space > size) {
+                    state.negative_space -= size;
+                }
+                else {
+                    size -= state.negative_space;
+                    state.negative_space = 0;
+                    state.available_space += size;
+                }
+            }
+            else {
+                state.available_space += size;
+            }
+            fs::remove(*it);
+            state.files.erase(it);
+        }
     }
 }
 
@@ -368,6 +393,7 @@ void receive_file(server_options &options, server_state &state, const struct soc
         if ((fd = open(filename.c_str(), O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)) < 0) {
             throw std::runtime_error("open");
         }
+        state.open_files.insert(filename);
         while (remaining_file_size > 0 && (read_len = read(msg_sock, buffer, BSIZE)) > 0 && !error_occurred) {
             ssize_t to_write_len = std::min(read_len, remaining_file_size);
             write_len = write(fd, buffer, to_write_len);
@@ -377,14 +403,13 @@ void receive_file(server_options &options, server_state &state, const struct soc
             remaining_file_size -= write_len;
         }
         if (read_len < 0 || remaining_file_size != 0) {
-//            throw std::runtime_error("reading from client socket");
-            /* TODO może nie zabijać serwera */
-//            kill(parent_pid, SIGUSR1);
+            /* TODO co począć */
             error_occurred = true;
         }
         printf("ending connection\n");
-        if (close(msg_sock) < 0)
+        if (close(msg_sock) < 0) {
             throw std::runtime_error("close");
+        }
     }
     else {
     }
@@ -392,6 +417,7 @@ void receive_file(server_options &options, server_state &state, const struct soc
     if (error_occurred) {
         unlink(filename.c_str());
     }
+    state.open_files.erase(filename);
 
     std::cout << "after accepting\n";
 
@@ -415,13 +441,11 @@ upload(server_options &options, server_state &state, const struct sockaddr_in &c
         send_simple_message(state.socket, client_address, "NO_WAY", request.data, request.cmd_seq);
     }
     else {
-        std::cout << "available_space: " << state.available_space << "\n";
         state.available_space -= request.param;
-        std::cout << "file_size: " << request.param << "\n";
-        std::cout << "available_space2: " << state.available_space << "\n";
-        std::cout << "parent upload\n";
+//        std::cout << "file_size: " << request.param << "\n";
+//        std::cout << "parent upload\n";
         fs::path new_file(options.SHRD_FLDR + "/" + request.data);
-        std::cout << new_file << "\n";
+//        std::cout << new_file << "\n";
         state.files.push_back(new_file);
         switch (fork()) {
             case -1:
@@ -436,23 +460,20 @@ upload(server_options &options, server_state &state, const struct sockaddr_in &c
 }
 
 void read_requests(server_options &options, server_state &state) {
-    /* data received */
+    /** data received */
     char buffer[BSIZE];
     ssize_t rcv_len;
     struct sockaddr_in client_address{};
     socklen_t addrlen = sizeof client_address;
-    ssize_t min_simpl_len = MIN_SIMPL_LEN;
-    ssize_t min_cmplx_len = MIN_CMPLX_LEN;
 
     for (;;) {
-        /* read */
+        /** read */
         rcv_len = recvfrom(state.socket, buffer, sizeof buffer, 0, (struct sockaddr *) &client_address, &addrlen);
         if (rcv_len < 0) {
             throw std::runtime_error("read");
         }
         else {
-            if (rcv_len < min_simpl_len) {
-                error_message(client_address, "Message too short.");
+            if (message_too_short<SIMPL_CMD>(client_address, rcv_len)) {
                 continue;
             }
 
@@ -460,12 +481,11 @@ void read_requests(server_options &options, server_state &state) {
             std::cout << request.cmd << " " << request.cmd_seq << "\n";
             std::cout << "port: " << htons(client_address.sin_port) << "\n";
             std::cout << "addr: " << inet_ntoa(client_address.sin_addr) << "\n";
-
             if (command_equal(request, "HELLO")) {
                 discover(state, options, client_address, request);
             }
             else if (command_equal(request, "DEL")) {
-                remove(state, request.data);
+                remove(state, client_address, request);
             }
             else if (command_equal(request, "LIST")) {
                 list(state, client_address, request);
@@ -474,8 +494,7 @@ void read_requests(server_options &options, server_state &state) {
                 fetch(options, state, client_address, request);
             }
             else if (command_equal(request, "ADD")) {
-                if (rcv_len < min_cmplx_len) {
-                    error_message(client_address, "Message too short.");
+                if (message_too_short<CMPLX_CMD>(client_address, rcv_len)) {
                     continue;
                 }
                 CMPLX_CMD complex_request(buffer, rcv_len);
@@ -497,6 +516,10 @@ int main(int argc, char const *argv[]) {
         read_requests(options, current_server_state);
         clean_up(current_server_state);
     } catch (const std::exception &e) {
-        std::cerr << "error: " << e.what() << "\n" << strerror(errno) << "\n";
+        std::cerr << "error: " << e.what();
+        if (errno != 0) {
+            std::cerr << " " << strerror(errno);
+        }
+        std::cerr << "\n";
     }
 }

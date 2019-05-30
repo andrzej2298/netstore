@@ -1,7 +1,5 @@
 /* TODO
- * - obsługiwanie cmd_seq
  * - obsługiwanie timeoutów
- * - dzielenie listy plików
  * - sprawdzanie, czy pakiet ma poprawne polecenie (CONNECT_ME itp.)
  * */
 
@@ -63,13 +61,16 @@ struct client_state {
     struct sockaddr_in remote_address{};
     std::vector<message<SIMPL_CMD>> previous_search;
     server_infos previous_servers;
+    std::set<std::string> open_files;
 };
 
 client_state current_client_state{};
 
 void clean_up(client_state &state) {
     close(state.socket);
-    exit(0);
+    for (const std::string &file : state.open_files) {
+        unlink(file.c_str());
+    }
 }
 
 uint64_t get_cmd_seq() {
@@ -100,6 +101,9 @@ client_options read_options(int argc, char const *argv[]) {
     }
     if (options.TIMEOUT > TIMEOUT_MAX || options.TIMEOUT == 0) {
         throw std::invalid_argument("timeout");
+    }
+    if (options.CMD_PORT < 0) {
+        throw std::invalid_argument("port");
     }
 
     return options;
@@ -178,8 +182,9 @@ void receive_timeouted_message(int socket, const chr::system_clock::time_point &
         }
     }
     else {
-//        server_messages.push_back({inet_ntoa(server_address.sin_addr), {buffer, rcv_len}});
-        server_messages.push_back({server_address, {buffer, rcv_len}});
+        if (!message_too_short<T>(server_address, rcv_len)) {
+            server_messages.push_back({server_address, {buffer, rcv_len}});
+        }
     }
 }
 
@@ -187,7 +192,6 @@ template<typename T>
 void
 receive_timeouted_messages(int socket, client_options &options, std::vector<message<T>> &server_messages,
                            std::size_t limit) {
-    /* TODO sprawdzić czy wiadomość jest poprawna (np. długość), bo będą błędy przy deserializacji */
     char buffer[BSIZE];
 
     chr::system_clock::time_point start_point = chr::system_clock::now();
@@ -258,7 +262,18 @@ void search(client_state &state, client_options &options, const std::string &arg
     }
 }
 
-void receive_file(client_options &options, const message<SIMPL_CMD> &info,
+void create_tcp_socket(int &sock, struct sockaddr_in &server_tcp) {
+    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0) {
+        throw std::runtime_error("socket");
+    }
+
+    if (connect(sock, (struct sockaddr *) &server_tcp, sizeof server_tcp) < 0) {
+        throw std::runtime_error("connect");
+    }
+}
+
+void receive_file(client_state &state, client_options &options, const message<SIMPL_CMD> &info,
                   const std::string &argument) {
     int sock;
     initialize_socket(sock);
@@ -275,26 +290,30 @@ void receive_file(client_options &options, const message<SIMPL_CMD> &info,
             /* not caused by timeout */
             throw std::runtime_error("read");
         }
+        else {
+            exit(0);
+        }
     }
+
     CMPLX_CMD message(buffer, rcv_len);
-    std::cout << "port: " << message.param << "\n";
+    if (!check_data_not_empty(message, info.address) ||
+        !check_cmd(message, "CONNECT_ME", info.address) ||
+        !check_cmd_seq(message, cmd_seq, info.address)) {
+        exit(0);
+    }
 
     int tcp_socket;
     struct sockaddr_in server_address{info.address};
     server_address.sin_port = message.param;
     std::string server_address_string(inet_ntoa(info.address.sin_addr));
 
-    tcp_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (tcp_socket < 0)
-        throw std::runtime_error("socket");
-
-    if (connect(tcp_socket, (struct sockaddr *) &server_address, sizeof server_address) < 0)
-        throw std::runtime_error("connect");
+    create_tcp_socket(tcp_socket, server_address);
 
     rcv_len = 1;
     std::string filename(options.OUT_FLDR + "/" + argument);
     std::cout << "filename: " << filename << "\n";
     int fd = open(filename.c_str(), O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    state.open_files.insert(filename);
     while (rcv_len > 0) {
         rcv_len = read(tcp_socket, buffer, BSIZE);
         if (write(fd, buffer, rcv_len) < 0) {
@@ -304,10 +323,10 @@ void receive_file(client_options &options, const message<SIMPL_CMD> &info,
     if (rcv_len < 0) {
         throw std::runtime_error("read");
     }
+    state.open_files.erase(filename);
     std::cout << "File " << argument << " downloaded (" << server_address_string << ":"
-              << server_address.sin_port << ")\n";
+              << ntohs(server_address.sin_port) << ")\n";
     close(tcp_socket);
-    std::cout << "child ending\n";
     exit(0);
 }
 
@@ -320,14 +339,11 @@ void fetch(client_state &state, client_options &options, const std::string &argu
                     case -1:
                         throw std::runtime_error("fork");
                     case 0:
-                        std::cout << "child fetch\n";
-                        receive_file(options, info, argument);
+                        receive_file(state, options, info, argument);
                         return;
                     default:
-                        std::cout << "parent fetch\n";
                         break;
                 }
-                /* TODO czy zamieniać sin_port na sieciową kolejność bitów */
                 return;
             }
         }
@@ -338,10 +354,11 @@ void fetch(client_state &state, client_options &options, const std::string &argu
 
 void send_file(client_options &options, client_state &state, const std::string &argument, fs::path &uploaded_file) {
     int sock;
+    bool success = true;
     initialize_socket(sock);
     hello(sock, state, options, false);
     if (state.previous_servers.empty()) {
-        std::cout << "File " << argument << " uploading failed, no server available\n";
+        std::cout << "File " << argument << " uploading failed (:) no server available\n";
         return;
     }
     std::cout << "sendfile\n";
@@ -359,8 +376,7 @@ void send_file(client_options &options, client_state &state, const std::string &
         receive_timeouted_messages(sock, options, messages, 1); /* receive at most one message */
         std::string can_add("CAN_ADD");
 
-        if (!messages.empty() && messages[0].command.cmd.substr(0, can_add.length()) == can_add) {
-            std::cout << messages[0].command.cmd << "\n";
+        if (!messages.empty() && check_cmd(messages[0], "CAN_ADD", server.address)) {
             message<CMPLX_CMD> &message(messages[0]);
             int tcp_socket;
             struct sockaddr_in server_address{server.address};
@@ -369,32 +385,44 @@ void send_file(client_options &options, client_state &state, const std::string &
             ssize_t read_len;
             std::string server_address_string(inet_ntoa(message.address.sin_addr));
 
-            tcp_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-            if (tcp_socket < 0)
-                throw std::runtime_error("socket");
+            create_tcp_socket(tcp_socket, server_address);
 
-            if (connect(tcp_socket, (struct sockaddr *) &server_address, sizeof server_address) < 0)
-                throw std::runtime_error("connect");
+            tcp_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (tcp_socket < 0) {
+                success = false;
+            }
+
+            if (success && connect(tcp_socket, (struct sockaddr *) &server_address, sizeof server_address) < 0) {
+                success = false;
+            }
 
             read_len = 1;
             const std::string &filename = uploaded_file.string();
             std::cout << "filename: " << filename << "\n";
             int fd = open(filename.c_str(), O_RDONLY);
-            while (read_len > 0) {
+            while (success && read_len > 0) {
                 read_len = read(fd, buffer, BSIZE);
                 if (write(tcp_socket, buffer, read_len) < 0) {
-                    throw std::runtime_error("write");
+                    success = false;
                 }
             }
             if (read_len < 0) {
                 throw std::runtime_error("read");
             }
-            std::cout << "File " << filename << " uploaded (" << server_address_string << ":"
-                      << server_address.sin_port << ")\n";
-            return;
+
+            if (!success) {
+                std::cout << "File " << argument << " uploading failed (" << server_address_string << ":"
+                          << ntohs(server_address.sin_port)
+                          << ") tcp connection error\n";
+            }
+            else {
+                std::cout << "File " << filename << " uploaded (" << server_address_string << ":"
+                          << ntohs(server_address.sin_port) << ")\n";
+            }
+            exit(0);
         }
     }
-    std::cout << "child ending\n";
+    std::cout << "File " << argument << " too big\n";
     exit(0);
 }
 
@@ -409,14 +437,11 @@ void upload(client_state &state, client_options &options, const std::string &arg
         case -1:
             throw std::runtime_error("fork");
         case 0:
-            std::cout << "child upload\n";
             send_file(options, state, argument, uploaded_file);
             return;
         default:
-            std::cout << "parent upload\n";
             break;
     }
-//    std::cout << "File " << argument << " uploading failed (" << {ip_serwera} << ":" << {port_serwera} << ") " << {opis_błędu} << "\n";
 }
 
 void remove(client_state &state, const std::string &argument) {
@@ -461,15 +486,13 @@ void handle_client_command(const boost::smatch &match, client_state &state, clie
 }
 
 void client_loop(client_state &state, client_options &options) {
-    /* TODO co ze spacjami przed i po oraz np. z danymi "search " oraz "search" */
-    /* TODO czy na pewno te spacje, plusy i gwiazdki są dobrze obsłużone */
     static const boost::regex discover_r("discover",
                                          boost::regex_constants::ECMAScript | boost::regex_constants::icase);
     static const boost::regex search_r("(search) ?(.*)",
                                        boost::regex_constants::ECMAScript | boost::regex_constants::icase);
     static const boost::regex fetch_r("(fetch) (.+)",
                                       boost::regex_constants::ECMAScript | boost::regex_constants::icase);
-    static const boost::regex upload_r("(upload) ?(.*)",
+    static const boost::regex upload_r("(upload) (.+)",
                                        boost::regex_constants::ECMAScript | boost::regex_constants::icase);
     static const boost::regex remove_r("(remove) (.+)",
                                        boost::regex_constants::ECMAScript | boost::regex_constants::icase);
@@ -493,6 +516,7 @@ void client_loop(client_state &state, client_options &options) {
 
 void catch_sigint(int) {
     clean_up(current_client_state);
+    exit(-1);
 }
 
 void add_signal_handlers() {
@@ -514,15 +538,19 @@ void add_signal_handlers() {
 }
 
 int main(int argc, char const *argv[]) {
-//    try {
-    add_signal_handlers();
-    client_options options = read_options(argc, argv);
-    initialize_connection(options, current_client_state);
-    client_loop(current_client_state, options);
-    clean_up(current_client_state);
-//    }
-//    catch (const std::exception &exception) {
-//        std::cerr << "error " << exception.what() << "\n";
-//    }
+    try {
+        add_signal_handlers();
+        client_options options = read_options(argc, argv);
+        initialize_connection(options, current_client_state);
+        client_loop(current_client_state, options);
+        clean_up(current_client_state);
+    }
+    catch (const std::exception &e) {
+        std::cerr << "error: " << e.what();
+        if (errno != 0) {
+            std::cerr << " " << strerror(errno);
+        }
+        std::cerr << "\n";
+    }
 }
 

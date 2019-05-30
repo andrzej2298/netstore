@@ -40,7 +40,6 @@ SIMPL_CMD::SIMPL_CMD(std::string _cmd, uint64_t _cmd_seq, std::string _data)
 SIMPL_CMD::SIMPL_CMD(const char *input, ssize_t length) {
     if (length < (ssize_t) MIN_SIMPL_LEN) {
         throw std::runtime_error("wrong message format");
-        /* TODO teraz trzeba to łapać */
     }
     serialized = new char[length];
     memcpy(serialized, input, length);
@@ -58,8 +57,8 @@ SIMPL_CMD::SIMPL_CMD(SIMPL_CMD &other) {
 
 SIMPL_CMD::SIMPL_CMD(SIMPL_CMD &&other) noexcept {
     serialized_length = other.serialized_length;
-    serialized = new char[other.serialized_length];
-    memcpy(serialized, other.serialized, serialized_length);
+    serialized = other.serialized;
+    other.serialized = nullptr;
     deserialize();
 }
 
@@ -100,7 +99,6 @@ CMPLX_CMD::CMPLX_CMD(std::string _cmd, uint64_t _cmd_seq, uint64_t _param, std::
 CMPLX_CMD::CMPLX_CMD(const char *input, ssize_t length) {
     if (length < (ssize_t) MIN_CMPLX_LEN) {
         throw std::runtime_error("wrong message format");
-        /* TODO teraz trzeba to łapać */
     }
     serialized = new char[length];
     memcpy(serialized, input, length);
@@ -118,8 +116,8 @@ CMPLX_CMD::CMPLX_CMD(CMPLX_CMD &other) {
 
 CMPLX_CMD::CMPLX_CMD(CMPLX_CMD &&other) noexcept {
     serialized_length = other.serialized_length;
-    serialized = new char[other.serialized_length];
-    memcpy(serialized, other.serialized, serialized_length);
+    serialized = other.serialized;
+    other.serialized = nullptr;
     deserialize();
 }
 
@@ -159,7 +157,6 @@ void set_socket_option(int socket, int optval, int level, int optname, const std
 uint64_t
 send_simple_message(int socket, const struct sockaddr_in &address, const std::string &cmd, const std::string &data,
                     uint64_t cmd_seq) {
-    /* TODO z czy bez nawiasów */
     SIMPL_CMD command(cmd, cmd_seq, data);
     if (sendto(socket, command.serialized, command.serialized_length, 0,
                (struct sockaddr *) &address, sizeof address) != command.serialized_length) {
@@ -189,5 +186,5 @@ void set_socket_receive_timeout(int socket, struct timeval wait_time) {
 void error_message(struct sockaddr_in address, const std::string &message) {
     std::cerr << "[PCKG ERROR] Skipping invalid package from " << inet_ntoa(address.sin_addr)
               << ":"
-              << address.sin_port << ". " << message << "\n";
+              << ntohs(address.sin_port) << ". " << message << "\n";
 }

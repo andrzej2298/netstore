@@ -301,7 +301,7 @@ void send_file(server_options &options, server_state &state, const struct sockad
     char buffer[BSIZE];
 
     send_complex_message(state.socket, client_udp, "CONNECT_ME", request.data, request.cmd_seq,
-                         server_tcp.sin_port);
+                         ntohs(server_tcp.sin_port));
 
     if (select(sock + 1, &fds, nullptr, nullptr, &wait_time)) {
         client_tcp_len = sizeof(client_tcp);
@@ -361,7 +361,7 @@ fetch(server_options &options, server_state &state, const struct sockaddr_in &cl
 
 void receive_file(server_options &options, server_state &state, const struct sockaddr_in &client_udp,
                   CMPLX_CMD &request) {
-        int sock, msg_sock;
+    int sock, msg_sock;
     struct sockaddr_in server_tcp{};
     struct sockaddr_in client_tcp{};
     socklen_t client_tcp_len = sizeof client_tcp;
@@ -378,8 +378,8 @@ void receive_file(server_options &options, server_state &state, const struct soc
     char buffer[BSIZE];
     std::string filename = options.SHRD_FLDR + "/" + request.data;
 
-    send_complex_message(state.socket, client_udp, "CAN_ADD", request.data, request.cmd_seq,
-                         server_tcp.sin_port);
+    send_complex_message(state.socket, client_udp, "CAN_ADD", "", request.cmd_seq,
+                         ntohs(server_tcp.sin_port));
 
     if (select(sock + 1, &fds, nullptr, nullptr, &wait_time)) {
         client_tcp_len = sizeof(client_tcp);
@@ -394,17 +394,34 @@ void receive_file(server_options &options, server_state &state, const struct soc
             throw std::runtime_error("open");
         }
         state.open_files.insert(filename);
-        while (remaining_file_size > 0 && (read_len = read(msg_sock, buffer, BSIZE)) > 0 && !error_occurred) {
+//        while (remaining_file_size > 0 && (read_len = read(msg_sock, buffer, BSIZE)) > 0 && !error_occurred) {
+//            ssize_t to_write_len = std::min(read_len, remaining_file_size);
+//            write_len = write(fd, buffer, to_write_len);
+//            if (write_len != to_write_len) {
+//                std::cout << "write ERROR\n";
+//                error_occurred = true;
+//            }
+//            remaining_file_size -= write_len;
+//            std::cout << "write len: " << write_len << "\n";
+//        }
+        read_len = read(msg_sock, buffer, BSIZE);
+        std::cout << "read_len: " << read_len << "\n";
+        while (remaining_file_size > 0 && read_len > 0 && !error_occurred) {
             ssize_t to_write_len = std::min(read_len, remaining_file_size);
             write_len = write(fd, buffer, to_write_len);
             if (write_len != to_write_len) {
+                std::cout << "write ERROR\n";
                 error_occurred = true;
             }
             remaining_file_size -= write_len;
+            std::cout << "write len: " << write_len << "\n";
+            read_len = read(msg_sock, buffer, BSIZE);
         }
         if (read_len < 0 || remaining_file_size != 0) {
             /* TODO co począć */
             error_occurred = true;
+            std::cout << "read ERROR\n";
+            std::cout << read_len << " " << remaining_file_size << "\n";
         }
         printf("ending connection\n");
         if (close(msg_sock) < 0) {
@@ -415,6 +432,7 @@ void receive_file(server_options &options, server_state &state, const struct soc
     }
 
     if (error_occurred) {
+        std::cout << "ERROR\n";
         unlink(filename.c_str());
     }
     state.open_files.erase(filename);
@@ -433,12 +451,15 @@ upload(server_options &options, server_state &state, const struct sockaddr_in &c
     for (auto &file : state.files) {
         if (file.filename().string() == request.data) {
             exists = true;
+            break;
         }
     }
 
     if (state.available_space < request.param || exists ||
         request.data.find('/') != std::string::npos || request.data.empty()) {
         send_simple_message(state.socket, client_address, "NO_WAY", request.data, request.cmd_seq);
+        std::cout << "NO_WAY " << (state.available_space < request.param) << exists <<
+                  (request.data.find('/') != std::string::npos) << request.data.empty() << "\n";
     }
     else {
         state.available_space -= request.param;

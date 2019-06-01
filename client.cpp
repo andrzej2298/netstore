@@ -159,21 +159,8 @@ uint64_t send_simple_client_message(int socket, client_state &state, const std::
     return send_simple_message(socket, state.remote_address, cmd, data, get_cmd_seq());
 }
 
-template<typename T>
-void receive_timeouted_message(int socket, const chr::system_clock::time_point &end_point,
-                               const chr::system_clock::time_point &current_time, struct timeval &wait_time,
-                               char *buffer,
-                               std::vector<message<T>> &server_messages) {
-    struct sockaddr_in server_address{};
-    socklen_t addrlen = sizeof server_address;
-    ssize_t rcv_len;
-    chr::nanoseconds remaining_time = end_point - current_time;
-    chr::seconds sec = chr::duration_cast<chr::seconds>(remaining_time);
-    wait_time.tv_sec = sec.count();
-    wait_time.tv_usec = chr::duration_cast<chr::microseconds>(remaining_time - sec).count();
-    set_socket_receive_timeout(socket, wait_time);
-
-    rcv_len = recvfrom(socket, buffer, BSIZE, 0, (struct sockaddr *) &server_address, &addrlen);
+void receive_message(int sock, char *buffer, struct sockaddr_in &server_address, ssize_t &rcv_len, socklen_t &addr_len) {
+    rcv_len = recvfrom(sock, buffer, BSIZE, 0, (struct sockaddr *) &server_address, &addr_len);
     if (rcv_len < 0) {
         if (rcv_len != -1 ||
             (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINPROGRESS)) {
@@ -181,10 +168,28 @@ void receive_timeouted_message(int socket, const chr::system_clock::time_point &
             throw std::runtime_error("read");
         }
     }
-    else {
-        if (!message_too_short<T>(server_address, rcv_len)) {
-            server_messages.push_back({server_address, {buffer, rcv_len}});
-        }
+}
+
+template<typename T>
+void receive_timeouted_message(int socket, const chr::system_clock::time_point &end_point,
+                               const chr::system_clock::time_point &current_time, struct timeval &wait_time,
+                               char *buffer,
+                               std::vector<message<T>> &server_messages) {
+    struct sockaddr_in server_address{};
+    socklen_t addr_len = sizeof server_address;
+    ssize_t rcv_len;
+    chr::nanoseconds remaining_time = end_point - current_time;
+    chr::seconds sec = chr::duration_cast<chr::seconds>(remaining_time);
+    wait_time.tv_sec = sec.count();
+    wait_time.tv_usec = chr::duration_cast<chr::microseconds>(remaining_time - sec).count();
+
+    set_socket_receive_timeout(socket, wait_time);
+    receive_message(socket, buffer, server_address, rcv_len, addr_len);
+    std::cout << "message size: " << rcv_len << "\n";
+
+    /* TODO obsłużyć jak jest timeout */
+    if (rcv_len != -1 && !message_too_short<T>(server_address, rcv_len)) {
+        server_messages.push_back({server_address, {buffer, rcv_len}});
     }
 }
 
@@ -282,8 +287,8 @@ void receive_file(client_state &state, client_options &options, const message<SI
     set_socket_receive_timeout(sock, {options.TIMEOUT, 0});
 
     ssize_t rcv_len;
-    socklen_t addrlen = sizeof info.address;
-    rcv_len = recvfrom(sock, buffer, BSIZE, 0, (struct sockaddr *) &info.address, &addrlen);
+    socklen_t addr_len = sizeof info.address;
+    rcv_len = recvfrom(sock, buffer, BSIZE, 0, (struct sockaddr *) &info.address, &addr_len);
     if (rcv_len < 0) {
         if (rcv_len != -1 ||
             (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINPROGRESS)) {
@@ -304,14 +309,13 @@ void receive_file(client_state &state, client_options &options, const message<SI
 
     int tcp_socket;
     struct sockaddr_in server_address{info.address};
-    server_address.sin_port = message.param;
+    server_address.sin_port = htons(message.param);
     std::string server_address_string(inet_ntoa(info.address.sin_addr));
 
     create_tcp_socket(tcp_socket, server_address);
 
     rcv_len = 1;
     std::string filename(options.OUT_FLDR + "/" + argument);
-    std::cout << "filename: " << filename << "\n";
     int fd = open(filename.c_str(), O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
     state.open_files.insert(filename);
     while (rcv_len > 0) {
@@ -352,9 +356,50 @@ void fetch(client_state &state, client_options &options, const std::string &argu
     std::cout << "File " << argument << " wasn't found\n";
 }
 
+void file_transfer(const message<CMPLX_CMD> &message, const server_info &server, const std::string &argument,
+                   fs::path &uploaded_file) {
+    bool success = true;
+    int tcp_socket;
+    struct sockaddr_in server_address{server.address};
+    server_address.sin_port = htons(message.command.param);
+    char buffer[BSIZE];
+    ssize_t read_len, write_len;
+    std::string server_address_string(inet_ntoa(message.address.sin_addr));
+
+    create_tcp_socket(tcp_socket, server_address);
+    std::cout << "port: " << ntohs(server_address.sin_port) << "\n";
+
+    read_len = 1;
+    const std::string &filename = uploaded_file.string();
+    std::cout << "filename: " << filename << "\n";
+    int fd = open(filename.c_str(), O_RDONLY);
+    while (success && read_len > 0) {
+        read_len = read(fd, buffer, BSIZE);
+        if (read_len > 0) {
+            if ((write_len = write(tcp_socket, buffer, read_len)) < 0 || write_len != read_len) {
+                success = false;
+            }
+            std::cout << "write len: " << write_len << "\n";
+        }
+    }
+    if (read_len < 0) {
+        throw std::runtime_error("read");
+    }
+
+    if (!success) {
+        std::cout << "File " << argument << " uploading failed (" << server_address_string << ":"
+                  << ntohs(server_address.sin_port)
+                  << ") tcp connection error\n";
+    }
+    else {
+        std::cout << "File " << filename << " uploaded (" << server_address_string << ":"
+                  << ntohs(server_address.sin_port) << ")\n";
+    }
+    exit(0);
+}
+
 void send_file(client_options &options, client_state &state, const std::string &argument, fs::path &uploaded_file) {
     int sock;
-    bool success = true;
     initialize_socket(sock);
     hello(sock, state, options, false);
     if (state.previous_servers.empty()) {
@@ -368,58 +413,44 @@ void send_file(client_options &options, client_state &state, const std::string &
                   return lhs.available_space > rhs.available_space;
               });
 
-
     for (const auto &server : state.previous_servers) {
-        send_complex_message(sock, server.address, "ADD", uploaded_file.filename().string(), get_cmd_seq(),
-                             file_size(uploaded_file));
-        std::vector<message<CMPLX_CMD>> messages;
-        receive_timeouted_messages(sock, options, messages, 1); /* receive at most one message */
-        std::string can_add("CAN_ADD");
-
-        if (!messages.empty() && check_cmd(messages[0], "CAN_ADD", server.address)) {
-            message<CMPLX_CMD> &message(messages[0]);
-            int tcp_socket;
-            struct sockaddr_in server_address{server.address};
-            server_address.sin_port = message.command.param;
-            char buffer[BSIZE];
-            ssize_t read_len;
-            std::string server_address_string(inet_ntoa(message.address.sin_addr));
-
-            create_tcp_socket(tcp_socket, server_address);
-
-            tcp_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-            if (tcp_socket < 0) {
-                success = false;
-            }
-
-            if (success && connect(tcp_socket, (struct sockaddr *) &server_address, sizeof server_address) < 0) {
-                success = false;
-            }
-
-            read_len = 1;
-            const std::string &filename = uploaded_file.string();
-            std::cout << "filename: " << filename << "\n";
-            int fd = open(filename.c_str(), O_RDONLY);
-            while (success && read_len > 0) {
-                read_len = read(fd, buffer, BSIZE);
-                if (write(tcp_socket, buffer, read_len) < 0) {
-                    success = false;
-                }
-            }
-            if (read_len < 0) {
-                throw std::runtime_error("read");
-            }
-
-            if (!success) {
-                std::cout << "File " << argument << " uploading failed (" << server_address_string << ":"
-                          << ntohs(server_address.sin_port)
-                          << ") tcp connection error\n";
+        char buffer[BSIZE];
+        ssize_t rcv_len;
+        struct sockaddr_in server_address{};
+        socklen_t addr_len;
+        uint64_t cmd_seq = send_complex_message(sock, server.address, "ADD", uploaded_file.filename().string(),
+                                                get_cmd_seq(),
+                                                file_size(uploaded_file));
+        struct timeval wait_time{options.TIMEOUT, 0};
+        set_socket_receive_timeout(sock, wait_time);
+        receive_message(sock, buffer, server_address, rcv_len, addr_len);
+        if (rcv_len > 0 && buffer[0] == 'C') {
+            if (message_too_short<CMPLX_CMD>(server_address, rcv_len)) {
+                continue;
             }
             else {
-                std::cout << "File " << filename << " uploaded (" << server_address_string << ":"
-                          << ntohs(server_address.sin_port) << ")\n";
+                CMPLX_CMD message(buffer, rcv_len);
+                if (check_cmd(message, "CAN_ADD", server_address) &&
+                    check_cmd_seq(message, cmd_seq, server_address) &&
+                    check_data_empty(message, server_address)) {
+                    file_transfer({server_address, message}, server, argument, uploaded_file);
+                }
             }
-            exit(0);
+        }
+        else if (rcv_len > 0 && buffer[0] == 'N') {
+            std::cout << "Here\n";
+            if (message_too_short<SIMPL_CMD>(server_address, rcv_len)) {
+                continue;
+            }
+            else {
+                SIMPL_CMD message(buffer, rcv_len);
+                check_cmd(message, "NO_WAY", server_address) &&
+                check_cmd_seq(message, cmd_seq, server_address) &&
+                check_data_equal(message, server_address, uploaded_file.filename().string());
+            }
+        }
+        else {
+            error_message(server_address, "Invalid cmd.");
         }
     }
     std::cout << "File " << argument << " too big\n";

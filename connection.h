@@ -90,9 +90,8 @@ void set_socket_receive_timeout(int socket, struct timeval wait_time);
 void error_message(struct sockaddr_in address, const std::string &message);
 
 /**
- *
  * template functions, necessary to be defined in the header file
- *
+ * (otherwise the compiler doesn't see them)
  * */
 
 template <typename T>
@@ -121,8 +120,17 @@ bool check_data_empty(T command, struct sockaddr_in address) {
 }
 
 template <typename T>
-bool check_cmd(T command, const std::string &cmd, struct sockaddr_in address) {
-    if (command.cmd.substr(0, cmd.size()) != cmd) {
+bool check_data_equal(T command, struct sockaddr_in address, const std::string &data) {
+    if (command.data != data) {
+        error_message(address, "Wrong info in data.");
+        std::cout << data << " " << command.data << "\n";
+    }
+    return command.data == data;
+}
+
+template <typename T>
+bool check_cmd(T command, const std::string &cmd, struct sockaddr_in address, bool print = true) {
+    if (print && command.cmd.substr(0, cmd.size()) != cmd) {
         error_message(address, "Wrong cmd.");
     }
     return command.cmd.substr(0, cmd.size()) == cmd;

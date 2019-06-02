@@ -112,6 +112,11 @@ client_options read_options(int argc, char const *argv[]) {
     if (options.CMD_PORT < 0) {
         throw std::invalid_argument("port");
     }
+    fs::path dir_path(options.OUT_FLDR);
+
+    if (!fs::exists(dir_path) || !fs::is_directory(dir_path)) {
+        throw std::invalid_argument("wrong directory");
+    }
 
     return options;
 }
@@ -660,7 +665,7 @@ int main(int argc, char const *argv[]) {
     catch (const std::exception &e) {
         std::cerr << "error: " << e.what();
         if (errno != 0) {
-            std::cerr << " " << strerror(errno);
+            std::cerr << ": " << strerror(errno);
         }
         std::cerr << "\n";
     }

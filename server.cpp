@@ -530,7 +530,7 @@ int main(int argc, char const *argv[]) {
     } catch (const std::exception &e) {
         std::cerr << "error: " << e.what();
         if (errno != 0) {
-            std::cerr << " " << strerror(errno);
+            std::cerr << ": " << strerror(errno);
         }
         std::cerr << "\n";
     }

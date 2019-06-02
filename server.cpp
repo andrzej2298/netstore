@@ -30,6 +30,9 @@ struct server_state;
 
 using file_infos = std::vector<fs::path>;
 
+/**
+ * Flags provided by the user.
+ */
 struct server_options {
     std::string MCAST_ADDR = "";
     int CMD_PORT = 0;
@@ -38,13 +41,17 @@ struct server_options {
     unsigned int TIMEOUT = 0;
 };
 
+/**
+ * Current server state.
+ */
 struct server_state {
-    uint64_t available_space = 0;
-    uint64_t negative_space = 0;
-    int socket = 0;
-    struct ip_mreq ip_mreq{};
-    file_infos files;
-    std::set<std::string> open_files;
+    uint64_t available_space = 0; /** file storage available */
+    uint64_t negative_space = 0; /** if after indexing the files their size is too big, the surplus number
+                                  * of bytes is stored here */
+    int socket = 0; /** UDP multicast socket */
+    struct ip_mreq ip_mreq{}; /** info about the multicast group */
+    file_infos files; /** list of files */
+    std::set<std::string> open_files; /** created files that haven't yet been saved */
 };
 
 server_state current_server_state{};
@@ -77,6 +84,7 @@ void add_signal_handlers() {
     sigemptyset(&sigint_handler.sa_mask);
     sigint_handler.sa_flags = 0;
 
+    /* handle CTRL+C */
     if (sigaction(SIGINT, &sigint_handler, nullptr) == -1) {
         throw std::runtime_error("sigaction");
     }
@@ -86,11 +94,18 @@ void add_signal_handlers() {
     sigemptyset(&sigchld_handler.sa_mask);
     sigchld_handler.sa_flags = 0;
 
+    /* handle an exit of a child */
     if (sigaction(SIGCHLD, &sigchld_handler, nullptr)) {
         throw std::runtime_error("sigaction");
     }
 }
 
+/**
+ * Reads command line flags supplied by the user.
+ * @param [in] argc Argument count.
+ * @param [in] argv
+ * @return Parsed options.
+ */
 server_options read_options(int argc, char const *argv[]) {
     po::options_description description("Allowed options");
     server_options options;
@@ -123,6 +138,11 @@ server_options read_options(int argc, char const *argv[]) {
     return options;
 }
 
+/**
+ * Index files in @ref options.SHRD_FLDR.
+ * @param [in] options
+ * @param [out] state
+ */
 void index_files(const server_options &options, server_state &state) {
     fs::path dir_path(options.SHRD_FLDR);
     state.available_space = options.MAX_SPACE;
@@ -151,6 +171,7 @@ void index_files(const server_options &options, server_state &state) {
     }
 }
 
+/** Initialize the UDP socket used to connect with the clients. */
 void initialize_connection(const server_options &options, server_state &state) {
     struct sockaddr_in local_address{};
 
@@ -180,6 +201,7 @@ void initialize_connection(const server_options &options, server_state &state) {
     }
 }
 
+/** Check if the request has a valid command. */
 bool command_equal(const SIMPL_CMD &request, const std::string &command) {
     for (std::size_t i = command.length(); i < request.cmd.length(); ++i) {
         if (request.cmd[i] != '\0') {
@@ -189,6 +211,7 @@ bool command_equal(const SIMPL_CMD &request, const std::string &command) {
     return request.cmd.substr(0, command.length()) == command;
 }
 
+/** Handle the clients "discover" message. */
 void
 discover(server_state &state, server_options &options, const struct sockaddr_in &client_address, SIMPL_CMD &request) {
     if (check_data_empty(request, client_address)) {
@@ -197,6 +220,7 @@ discover(server_state &state, server_options &options, const struct sockaddr_in 
     }
 }
 
+/** Handle the clients "remove" message. */
 void remove(server_state &state, const struct sockaddr_in &client_address, SIMPL_CMD &request) {
     if (check_data_not_empty(request, client_address)) {
         const std::string &target_file_name = request.data;
@@ -224,6 +248,7 @@ void remove(server_state &state, const struct sockaddr_in &client_address, SIMPL
     }
 }
 
+/** Handle the clients "search" message. */
 void list(server_state &state, const struct sockaddr_in &client_address, SIMPL_CMD &request) {
     std::string &target_file_name = request.data;
     std::list<std::string> results;
@@ -241,6 +266,7 @@ void list(server_state &state, const struct sockaddr_in &client_address, SIMPL_C
             std::string current = results.front();
             data = current;
             results.pop_front();
+            /* prepare one UDP packet */
             while (!results.empty() && data.size() + current.size() + 1 < MAX_SIMPL_DATA_LEN) {
                 current = results.front();
                 results.pop_front();
@@ -252,6 +278,7 @@ void list(server_state &state, const struct sockaddr_in &client_address, SIMPL_C
     }
 }
 
+/** Creates a TCP socket used to transfer files between the client and the server. */
 void
 create_tcp_socket(int &sock, struct sockaddr_in &server_tcp,
                   socklen_t &server_tcp_len) {
@@ -272,11 +299,14 @@ create_tcp_socket(int &sock, struct sockaddr_in &server_tcp,
     if (listen(sock, QUEUE_LENGTH) < 0) {
         throw std::runtime_error("listen");
     }
+
+    /* get the port number */
     if (getsockname(sock, (struct sockaddr *) &server_tcp, &server_tcp_len) < 0) {
         throw std::runtime_error("getsockname");
     }
 }
 
+/** Handles the transfer of a file to the client. */
 void send_file(server_options &options, server_state &state, const struct sockaddr_in &client_udp,
                SIMPL_CMD &request, const fs::path &path) {
     int sock, msg_sock;
@@ -296,6 +326,7 @@ void send_file(server_options &options, server_state &state, const struct sockad
     send_complex_message(state.socket, client_udp, "CONNECT_ME", request.data, request.cmd_seq,
                          ntohs(server_tcp.sin_port));
 
+    /* wait TIMEOUT to connect */
     if (select(sock + 1, &fds, nullptr, nullptr, &wait_time)) {
         client_tcp_len = sizeof(client_tcp);
         msg_sock = accept(sock, (struct sockaddr *) &client_tcp, &client_tcp_len);
@@ -325,6 +356,7 @@ void send_file(server_options &options, server_state &state, const struct sockad
     exit(0);
 }
 
+/** Handle the clients "fetch" message. */
 void
 fetch(server_options &options, server_state &state, const struct sockaddr_in &client_address, SIMPL_CMD &request) {
     for (const fs::path &file : state.files) {
@@ -344,7 +376,7 @@ fetch(server_options &options, server_state &state, const struct sockaddr_in &cl
     error_message(client_address, "Invalid file name.");
 }
 
-
+/** Handles the transfer of a file from the client. */
 void receive_file(server_options &options, server_state &state, const struct sockaddr_in &client_udp,
                   CMPLX_CMD &request) {
     int sock, msg_sock;
@@ -367,6 +399,7 @@ void receive_file(server_options &options, server_state &state, const struct soc
     send_complex_message(state.socket, client_udp, "CAN_ADD", "", request.cmd_seq,
                          ntohs(server_tcp.sin_port));
 
+    /* wait TIMEOUT to connect */
     if (select(sock + 1, &fds, nullptr, nullptr, &wait_time)) {
         client_tcp_len = sizeof(client_tcp);
         msg_sock = accept(sock, (struct sockaddr *) &client_tcp, &client_tcp_len);
@@ -379,7 +412,7 @@ void receive_file(server_options &options, server_state &state, const struct soc
         if ((fd = open(filename.c_str(), O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)) < 0) {
             throw std::runtime_error("open");
         }
-        state.open_files.insert(filename);
+        state.open_files.insert(filename); /* marks the opening of the file */
         read_len = read(msg_sock, buffer, BSIZE);
         while (remaining_file_size > 0 && read_len > 0 && !error_occurred) {
             ssize_t to_write_len = std::min(read_len, remaining_file_size);
@@ -401,13 +434,13 @@ void receive_file(server_options &options, server_state &state, const struct soc
     if (error_occurred) {
         unlink(filename.c_str());
     }
-    state.open_files.erase(filename);
-
+    state.open_files.erase(filename); /* marks the closing of the file */
     close(state.socket);
     close(sock);
     exit(0);
 }
 
+/** Handle the clients "upload" message. */
 void
 upload(server_options &options, server_state &state, const struct sockaddr_in &client_address, CMPLX_CMD &request) {
     bool exists = false;
@@ -418,6 +451,8 @@ upload(server_options &options, server_state &state, const struct sockaddr_in &c
         }
     }
 
+    /* checks available space, if such a file already exists, if the file name
+     * contains a '/', if the file name is empty */
     if (state.available_space < request.param || exists ||
         request.data.find('/') != std::string::npos || request.data.empty()) {
         send_simple_message(state.socket, client_address, "NO_WAY", request.data, request.cmd_seq);
@@ -438,6 +473,7 @@ upload(server_options &options, server_state &state, const struct sockaddr_in &c
     }
 }
 
+/** Server loop. */
 void read_requests(server_options &options, server_state &state) {
     /* data received */
     char buffer[BSIZE];

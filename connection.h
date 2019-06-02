@@ -123,7 +123,6 @@ template <typename T>
 bool check_data_equal(T command, struct sockaddr_in address, const std::string &data) {
     if (command.data != data) {
         error_message(address, "Wrong info in data.");
-        std::cout << data << " " << command.data << "\n";
     }
     return command.data == data;
 }

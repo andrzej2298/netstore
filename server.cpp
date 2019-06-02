@@ -171,8 +171,6 @@ void initialize_connection(const server_options &options, server_state &state) {
         throw std::runtime_error("setsockopt");
     }
 
-    set_socket_option(state.socket, 1, SOL_SOCKET, SO_REUSEADDR, "reuseaddr");
-
     /* local address and port */
     local_address.sin_family = AF_INET;
     local_address.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -231,7 +229,6 @@ void list(server_state &state, const struct sockaddr_in &client_address, SIMPL_C
     std::list<std::string> results;
     for (const fs::path &file : state.files) {
         std::string file_name = file.filename().string();
-//        std::cout << file_name << "\n";
         if (file_name.find(target_file_name) != std::string::npos) {
             results.push_back(file_name);
         }
@@ -250,7 +247,6 @@ void list(server_state &state, const struct sockaddr_in &client_address, SIMPL_C
                 data += "\n" + current;
             }
         }
-        std::cout << data.length();
         send_simple_message(state.socket, client_address, "MY_LIST", data, request.cmd_seq);
         data.clear();
     }
@@ -279,9 +275,6 @@ create_tcp_socket(int &sock, struct sockaddr_in &server_tcp,
     if (getsockname(sock, (struct sockaddr *) &server_tcp, &server_tcp_len) < 0) {
         throw std::runtime_error("getsockname");
     }
-
-    std::cout << "port: " << ntohs(server_tcp.sin_port) << "\n";
-    std::cout << "accepting\n";
 }
 
 void send_file(server_options &options, server_state &state, const struct sockaddr_in &client_udp,
@@ -323,19 +316,12 @@ void send_file(server_options &options, server_state &state, const struct sockad
         if (read_len < 0) {
             throw std::runtime_error("read");
         }
-        printf("ending connection\n");
         if (close(msg_sock) < 0)
             throw std::runtime_error("close");
     }
-    else {
-        std::cout << "not connected\n";
-    }
-    std::cout << "after accepting\n";
-
 
     close(state.socket);
     close(sock);
-    std::cout << "child ending\n";
     exit(0);
 }
 
@@ -394,54 +380,31 @@ void receive_file(server_options &options, server_state &state, const struct soc
             throw std::runtime_error("open");
         }
         state.open_files.insert(filename);
-//        while (remaining_file_size > 0 && (read_len = read(msg_sock, buffer, BSIZE)) > 0 && !error_occurred) {
-//            ssize_t to_write_len = std::min(read_len, remaining_file_size);
-//            write_len = write(fd, buffer, to_write_len);
-//            if (write_len != to_write_len) {
-//                std::cout << "write ERROR\n";
-//                error_occurred = true;
-//            }
-//            remaining_file_size -= write_len;
-//            std::cout << "write len: " << write_len << "\n";
-//        }
         read_len = read(msg_sock, buffer, BSIZE);
-        std::cout << "read_len: " << read_len << "\n";
         while (remaining_file_size > 0 && read_len > 0 && !error_occurred) {
             ssize_t to_write_len = std::min(read_len, remaining_file_size);
             write_len = write(fd, buffer, to_write_len);
             if (write_len != to_write_len) {
-                std::cout << "write ERROR\n";
                 error_occurred = true;
             }
             remaining_file_size -= write_len;
-            std::cout << "write len: " << write_len << "\n";
             read_len = read(msg_sock, buffer, BSIZE);
         }
         if (read_len < 0 || remaining_file_size != 0) {
-            /* TODO co począć */
             error_occurred = true;
-            std::cout << "read ERROR\n";
-            std::cout << read_len << " " << remaining_file_size << "\n";
         }
-        printf("ending connection\n");
         if (close(msg_sock) < 0) {
             throw std::runtime_error("close");
         }
     }
-    else {
-    }
 
     if (error_occurred) {
-        std::cout << "ERROR\n";
         unlink(filename.c_str());
     }
     state.open_files.erase(filename);
 
-    std::cout << "after accepting\n";
-
     close(state.socket);
     close(sock);
-    std::cout << "child ending\n";
     exit(0);
 }
 
@@ -458,15 +421,10 @@ upload(server_options &options, server_state &state, const struct sockaddr_in &c
     if (state.available_space < request.param || exists ||
         request.data.find('/') != std::string::npos || request.data.empty()) {
         send_simple_message(state.socket, client_address, "NO_WAY", request.data, request.cmd_seq);
-        std::cout << "NO_WAY " << (state.available_space < request.param) << exists <<
-                  (request.data.find('/') != std::string::npos) << request.data.empty() << "\n";
     }
     else {
         state.available_space -= request.param;
-//        std::cout << "file_size: " << request.param << "\n";
-//        std::cout << "parent upload\n";
         fs::path new_file(options.SHRD_FLDR + "/" + request.data);
-//        std::cout << new_file << "\n";
         state.files.push_back(new_file);
         switch (fork()) {
             case -1:
@@ -481,14 +439,14 @@ upload(server_options &options, server_state &state, const struct sockaddr_in &c
 }
 
 void read_requests(server_options &options, server_state &state) {
-    /** data received */
+    /* data received */
     char buffer[BSIZE];
     ssize_t rcv_len;
     struct sockaddr_in client_address{};
     socklen_t addrlen = sizeof client_address;
 
     for (;;) {
-        /** read */
+        /* read */
         rcv_len = recvfrom(state.socket, buffer, sizeof buffer, 0, (struct sockaddr *) &client_address, &addrlen);
         if (rcv_len < 0) {
             throw std::runtime_error("read");
@@ -499,9 +457,6 @@ void read_requests(server_options &options, server_state &state) {
             }
 
             SIMPL_CMD request(buffer, rcv_len);
-            std::cout << request.cmd << " " << request.cmd_seq << "\n";
-            std::cout << "port: " << htons(client_address.sin_port) << "\n";
-            std::cout << "addr: " << inet_ntoa(client_address.sin_addr) << "\n";
             if (command_equal(request, "HELLO")) {
                 discover(state, options, client_address, request);
             }

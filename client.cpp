@@ -1,8 +1,3 @@
-/* TODO
- * - obsługiwanie timeoutów
- * - sprawdzanie, czy pakiet ma poprawne polecenie (CONNECT_ME itp.)
- * */
-
 #include <iostream>
 #include <algorithm>
 #include <chrono>
@@ -185,9 +180,7 @@ void receive_timeouted_message(int socket, const chr::system_clock::time_point &
 
     set_socket_receive_timeout(socket, wait_time);
     receive_message(socket, buffer, server_address, rcv_len, addr_len);
-    std::cout << "message size: " << rcv_len << "\n";
 
-    /* TODO obsłużyć jak jest timeout */
     if (rcv_len != -1 && !message_too_short<T>(server_address, rcv_len)) {
         server_messages.push_back({server_address, {buffer, rcv_len}});
     }
@@ -296,7 +289,7 @@ void receive_file(client_state &state, client_options &options, const message<SI
             throw std::runtime_error("read");
         }
         else {
-            exit(0);
+            std::cout << "File " <<  argument << " downloading failed (:) server didn't answer\n";
         }
     }
 
@@ -364,14 +357,12 @@ void file_transfer(const message<CMPLX_CMD> &message, const server_info &server,
     server_address.sin_port = htons(message.command.param);
     char buffer[BSIZE];
     ssize_t read_len, write_len;
-    std::string server_address_string(inet_ntoa(message.address.sin_addr));
 
     create_tcp_socket(tcp_socket, server_address);
-    std::cout << "port: " << ntohs(server_address.sin_port) << "\n";
 
+    std::string server_address_string(inet_ntoa(server_address.sin_addr));
     read_len = 1;
     const std::string &filename = uploaded_file.string();
-    std::cout << "filename: " << filename << "\n";
     int fd = open(filename.c_str(), O_RDONLY);
     while (success && read_len > 0) {
         read_len = read(fd, buffer, BSIZE);
@@ -379,7 +370,6 @@ void file_transfer(const message<CMPLX_CMD> &message, const server_info &server,
             if ((write_len = write(tcp_socket, buffer, read_len)) < 0 || write_len != read_len) {
                 success = false;
             }
-            std::cout << "write len: " << write_len << "\n";
         }
     }
     if (read_len < 0) {
@@ -406,7 +396,6 @@ void send_file(client_options &options, client_state &state, const std::string &
         std::cout << "File " << argument << " uploading failed (:) no server available\n";
         return;
     }
-    std::cout << "sendfile\n";
 
     std::sort(state.previous_servers.begin(), state.previous_servers.end(),
               [](const server_info &lhs, const server_info &rhs) -> bool {
@@ -438,7 +427,6 @@ void send_file(client_options &options, client_state &state, const std::string &
             }
         }
         else if (rcv_len > 0 && buffer[0] == 'N') {
-            std::cout << "Here\n";
             if (message_too_short<SIMPL_CMD>(server_address, rcv_len)) {
                 continue;
             }

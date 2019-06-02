@@ -565,6 +565,7 @@ void handle_client_command(const boost::smatch &match, client_state &state, clie
         }
         else if (command == "exit") {
             clean_up(state);
+            exit(0);
         }
         else {
             assert(false);
